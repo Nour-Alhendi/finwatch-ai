@@ -1,0 +1,44 @@
+assets: 
+  - ticker: "^SPX"
+    name: "S&P 500"
+    sector: "Index"
+  
+  - ticker: "AAPL"
+    name: "Apple"
+    sector: "Technology"
+
+  - ticker: "MSFT"
+    name: "Microsoft"
+    sector: "Technology"
+
+  - ticker: "NVDA"
+    name: "Nvidia"
+    sector: "Technology"
+
+  - ticker: "XOM"
+    name: "Exxon Mobil Corp"
+    sector: "Energy"
+
+  - ticker: "TSLA"
+    name: "Tesla"
+    sector: "Consumer Discretionary"
+
+  - ticker: "JPM"
+    name: "JPMorgan"
+    sector: "Financials"
+
+  - ticker: "JNJ"
+    name: "Johnson & Johnson"
+    sector: "Healthcare"
+
+  - ticker: "PG"
+    name: "Procter & Gamble"
+    sector: "Consumer Staples"
+
+  - ticker: "CAT"
+    name: "Caterpillar"
+    sector: "Industrials"
+
+  - ticker: "KO"
+    name: "Coca-Cola"
+    sector: "Consumer Staples"
