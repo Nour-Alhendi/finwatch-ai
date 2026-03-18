@@ -1,3 +1,6 @@
+# ––– trend_context: detects the market regime (bull/bear/transition/sideways) using MA50 & MA200 –––
+# then joins it onto each stock's context file
+
 import pandas as pd
 from pathlib import Path
 import numpy as np
@@ -5,7 +8,7 @@ import numpy as np
 INPUT_DIR = Path("data/detection")
 OUTPUT_DIR = Path("data/context")
 
-# Detect the current market regime using MA50 &  MA200 (Trend Following)
+# Detect the current market regime using MA50 & MA200 (Trend Following)
 def detect_regime():
     df = pd.read_parquet(INPUT_DIR / "^SPX.parquet")
     df = df.set_index("Date")
@@ -25,16 +28,15 @@ def detect_regime():
 
     return df[["regime", "ma200", "ma50"]]
 
-# loop over all diles and saves results
-def run_market_trend():
-      OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-      regime_df = detect_regime()
-      for file in OUTPUT_DIR.glob("*.parquet"):
-            df = pd.read_parquet(file)
-            df = df.set_index("Date").join(regime_df, how="left").reset_index()
-            df.to_parquet(OUTPUT_DIR / file.name)
-            print(f"Saved: {file.name}")
+# Loop over all files and join regime
+def run_trend_context():
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    regime_df = detect_regime()
+    for file in OUTPUT_DIR.glob("*.parquet"):
+        df = pd.read_parquet(file)
+        df = df.set_index("Date").join(regime_df, how="left").reset_index()
+        df.to_parquet(OUTPUT_DIR / file.name)
+        print(f"Saved: {file.name}")
 
-# Entry point
 if __name__ == "__main__":
-        run_market_trend()
+    run_trend_context()
