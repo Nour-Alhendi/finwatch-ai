@@ -67,8 +67,8 @@ def compare(df, spx, volatility, etf_data, ticker):
     )
     return df.reset_index()
 
-# Main function: run index comparison for all stocks and save results
-def run_index_comparison():
+# Main function: run market context for all stocks and save results
+def run_market_context():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     spx = load_spx()
     volatility = load_volatility()
@@ -84,4 +84,4 @@ def run_index_comparison():
         print(f"Saved: {ticker}.parquet")
 
 if __name__ == "__main__":
-    run_index_comparison()
+    run_market_context()

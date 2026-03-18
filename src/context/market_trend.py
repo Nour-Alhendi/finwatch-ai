@@ -26,7 +26,7 @@ def detect_regime():
     return df[["regime", "ma200", "ma50"]]
 
 # loop over all diles and saves results
-def run_detect_regime():
+def run_market_trend():
       OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
       regime_df = detect_regime()
       for file in OUTPUT_DIR.glob("*.parquet"):
@@ -37,4 +37,4 @@ def run_detect_regime():
 
 # Entry point
 if __name__ == "__main__":
-        run_detect_regime()
+        run_market_trend()
