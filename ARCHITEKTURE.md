@@ -46,18 +46,17 @@ Description:     AI-Driven Financial Anomaly Detection
 # LAYER 4 – ANOMALY DETECTION
 │
 ├── Statistical:    Z-Score (±3σ, 20d + 60d window)
-├── ML:             Isolation Forest (group-aware, contamination=0.05)
+├── ML:             Isolation Forest (group-aware, percentile threshold per group)
 ├── Deep Learning:  Dual LSTM Autoencoder
 │   ├── low_vol_model  → trained on calm periods per group
 │   ├── high_vol_model → trained on volatile periods per group
-│   ├── regime-specific thresholds (no lookahead)
-│   └── cooldown=3 to prevent clustering
+│   └── regime-specific thresholds from train data only (no lookahead)
 ├── Combine:
 │   ├── anomaly_score (0–4): z + z_60 + if + ae
 │   ├── combined_anomaly (bool)
 │   ├── market_anomaly  = is_market_wide  & combined_anomaly
 │   └── sector_anomaly  = is_sector_wide  & combined_anomaly
-├── Severity:       MINOR / WARNING / CRITICAL
+├── Severity:       normal / watch / warning / critical
 └── Output: data/detection/ parquet files
 
 # LAYER 5 – RISK PREDICTION

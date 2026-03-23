@@ -13,8 +13,8 @@ from tensorflow.keras.callbacks import EarlyStopping
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from config.features import LSTM_AE_FEATURES
 
-INPUT_DIR  = Path("data/features")
-OUTPUT_DIR = Path("data/features")
+INPUT_DIR  = Path("data/detection")
+OUTPUT_DIR = Path("data/detection")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SEQUENCE_LENGTH = 20
@@ -81,6 +81,8 @@ def run_autoencoder():
                 continue
             df = pd.read_parquet(file)
             df = df.dropna(subset=LSTM_AE_FEATURES).reset_index(drop=True)
+            split_date = pd.Timestamp("2024-01-01")
+            df["_is_train"] = df["Date"] < split_date
             df["_ticker"] = ticker
             frames.append(df)
 
@@ -92,22 +94,25 @@ def run_autoencoder():
         low_frames  = []
         high_frames = []
 
+        # Threshold and scaler only from training data (no lookahead)
         for df in frames:
-            vol_threshold = df["volatility"].quantile(calm_q)
+            train_df = df[df["_is_train"]]
+            vol_threshold = train_df["volatility"].quantile(calm_q)
             df["_is_low_vol"]    = df["volatility"] <= vol_threshold
             df["_vol_threshold"] = vol_threshold
 
             scaler_low  = MinMaxScaler()
             scaler_high = MinMaxScaler()
 
-            low_df  = df[df["_is_low_vol"]].copy().reset_index(drop=True)
-            high_df = df[~df["_is_low_vol"]].copy().reset_index(drop=True)
+            low_df_train  = df[df["_is_low_vol"] &  df["_is_train"]].copy().reset_index(drop=True)
+            high_df_train = df[~df["_is_low_vol"] & df["_is_train"]].copy().reset_index(drop=True)
 
-            if len(low_df) > SEQUENCE_LENGTH:
-                low_df[LSTM_AE_FEATURES]  = scaler_low.fit_transform(low_df[LSTM_AE_FEATURES])
-                low_df["_scaler"]         = None
-                low_df["_scaler_obj"]     = [scaler_low] * len(low_df)
-                low_frames.append((df, low_df, high_df, scaler_low, scaler_high))
+            if len(low_df_train) > SEQUENCE_LENGTH:
+                scaler_low.fit(low_df_train[LSTM_AE_FEATURES])
+                scaler_high.fit(high_df_train[LSTM_AE_FEATURES])
+                low_df_train[LSTM_AE_FEATURES]  = scaler_low.transform(low_df_train[LSTM_AE_FEATURES])
+                high_df_train[LSTM_AE_FEATURES] = scaler_high.transform(high_df_train[LSTM_AE_FEATURES])
+                low_frames.append((df, low_df_train, high_df_train, scaler_low, scaler_high))
 
         if not low_frames:
             print(f"Skipping group {group_name}: not enough low-vol data")
@@ -117,12 +122,11 @@ def run_autoencoder():
         X_train_low  = []
         X_train_high = []
 
-        for (df, low_df, high_df, scaler_low, scaler_high) in low_frames:
-            if len(low_df) > SEQUENCE_LENGTH:
-                high_df[LSTM_AE_FEATURES] = scaler_high.fit_transform(high_df[LSTM_AE_FEATURES])
-                X_train_low.append(build_sequences(low_df[LSTM_AE_FEATURES].values))
-            if len(high_df) > SEQUENCE_LENGTH:
-                X_train_high.append(build_sequences(high_df[LSTM_AE_FEATURES].values))
+        for (df, low_df_train, high_df_train, scaler_low, scaler_high) in low_frames:
+            if len(low_df_train) > SEQUENCE_LENGTH:
+                X_train_low.append(build_sequences(low_df_train[LSTM_AE_FEATURES].values))
+            if len(high_df_train) > SEQUENCE_LENGTH:
+                X_train_high.append(build_sequences(high_df_train[LSTM_AE_FEATURES].values))
 
         X_train_low  = np.concatenate(X_train_low)  if X_train_low  else None
         X_train_high = np.concatenate(X_train_high) if X_train_high else None
@@ -145,40 +149,45 @@ def run_autoencoder():
             print(f"[{group_name}] high_vol_model trained on {X_train_high.shape[0]} sequences")
 
         # Predict and save per ticker
-        for (df, low_df, high_df, scaler_low, scaler_high) in low_frames:
+        for (df, low_df_train, high_df_train, scaler_low, scaler_high) in low_frames:
             ticker        = df["_ticker"].iloc[0]
             vol_threshold = df["_vol_threshold"].iloc[0]
 
             orig_df = pd.read_parquet(INPUT_DIR / f"{ticker}.parquet")
-            orig_df = orig_df.dropna(subset=LSTM_AE_FEATURES).reset_index(drop=True)
+            feat_df = orig_df.dropna(subset=LSTM_AE_FEATURES).reset_index(drop=True)
             orig_df["ae_error"]   = np.nan
             orig_df["ae_anomaly"] = False
-            orig_df["_is_low_vol"] = orig_df["volatility"] <= vol_threshold
+            feat_df["_is_low_vol"] = feat_df["volatility"] <= vol_threshold
 
             # Low vol regime prediction
-            low_idx  = orig_df[orig_df["_is_low_vol"]].index
-            high_idx = orig_df[~orig_df["_is_low_vol"]].index
+            low_idx  = feat_df[feat_df["_is_low_vol"]].index
+            high_idx = feat_df[~feat_df["_is_low_vol"]].index
 
             if len(low_idx) > SEQUENCE_LENGTH:
-                low_scaled  = scaler_low.transform(orig_df.loc[low_idx, LSTM_AE_FEATURES])
+                low_scaled  = scaler_low.transform(feat_df.loc[low_idx, LSTM_AE_FEATURES])
                 X_low_all   = build_sequences(low_scaled)
                 errors_low  = get_errors(model_low, X_low_all)
-                threshold_low = np.percentile(errors_low, 100 - perc)
-                target_idx  = low_idx[SEQUENCE_LENGTH:SEQUENCE_LENGTH + len(errors_low)]
-                orig_df.loc[target_idx, "ae_error"]   = errors_low
-                orig_df.loc[target_idx, "ae_anomaly"] = errors_low > threshold_low
+                train_low_idx = feat_df[feat_df["_is_low_vol"] & (feat_df["Date"] < split_date)].index
+                train_low_errors = get_errors(model_low, build_sequences(scaler_low.transform(feat_df.loc[train_low_idx, LSTM_AE_FEATURES])))
+                threshold_low = np.percentile(train_low_errors, 100 - perc)
+                target_dates  = feat_df.loc[low_idx[SEQUENCE_LENGTH:SEQUENCE_LENGTH + len(errors_low)], "Date"].values
+                mask = orig_df["Date"].isin(target_dates)
+                orig_df.loc[mask, "ae_error"]   = errors_low
+                orig_df.loc[mask, "ae_anomaly"] = errors_low > threshold_low
 
             # High vol regime prediction
             if len(high_idx) > SEQUENCE_LENGTH:
-                high_scaled  = scaler_high.transform(orig_df.loc[high_idx, LSTM_AE_FEATURES])
+                high_scaled  = scaler_high.transform(feat_df.loc[high_idx, LSTM_AE_FEATURES])
                 X_high_all   = build_sequences(high_scaled)
                 errors_high  = get_errors(model_high, X_high_all)
-                threshold_high = np.percentile(errors_high, 100 - perc)
-                target_idx   = high_idx[SEQUENCE_LENGTH:SEQUENCE_LENGTH + len(errors_high)]
-                orig_df.loc[target_idx, "ae_error"]   = errors_high
-                orig_df.loc[target_idx, "ae_anomaly"] = errors_high > threshold_high
+                train_high_idx = feat_df[~feat_df["_is_low_vol"] & (feat_df["Date"] < split_date)].index
+                train_high_errors = get_errors(model_high, build_sequences(scaler_high.transform(feat_df.loc[train_high_idx, LSTM_AE_FEATURES])))
+                threshold_high = np.percentile(train_high_errors, 100 - perc)
+                target_dates  = feat_df.loc[high_idx[SEQUENCE_LENGTH:SEQUENCE_LENGTH + len(errors_high)], "Date"].values
+                mask = orig_df["Date"].isin(target_dates)
+                orig_df.loc[mask, "ae_error"]   = errors_high
+                orig_df.loc[mask, "ae_anomaly"] = errors_high > threshold_high
 
-            orig_df = orig_df.drop(columns=["_is_low_vol"])
             orig_df.to_parquet(OUTPUT_DIR / f"{ticker}.parquet")
             print(f"  Saved: {ticker}.parquet  ({orig_df['ae_anomaly'].sum()} anomalies)")
 

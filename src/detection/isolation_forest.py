@@ -11,8 +11,8 @@ from sklearn.ensemble import IsolationForest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from config.features import IF_FEATURES
 
-INPUT_DIR = Path("data/features")
-OUTPUT_DIR = Path("data/features")
+INPUT_DIR = Path("data/detection")
+OUTPUT_DIR = Path("data/detection")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 GROUPS = {
@@ -45,7 +45,7 @@ def run_isolation_forest():
                 print(f"  Skipping {ticker}: file not found")
                 continue
             df = pd.read_parquet(file)
-            df = df[df["Date"] >= df["Date"].max() - pd.DateOffset(years=4)].reset_index(drop=True)
+            df["_is_train"] = df["Date"] >= df["Date"].max() - pd.DateOffset(years=4)
             df = df.dropna(subset=IF_FEATURES).reset_index(drop=True)  # type: ignore
             df["_ticker"] = ticker
             frames.append(df)
@@ -57,8 +57,7 @@ def run_isolation_forest():
         # Train on calm periods across the whole group
         group_df = pd.concat(frames, ignore_index=True)
         normal_mask = group_df["volatility"] < group_df["volatility"].quantile(calm_q)
-        X_normal = group_df[normal_mask][IF_FEATURES].values
-
+        X_normal = group_df[normal_mask & group_df["_is_train"]][IF_FEATURES].values
         model = IsolationForest(n_estimators=100, random_state=42)
         model.fit(X_normal)
         print(f"[{group_name}] trained on {X_normal.shape[0]} calm rows from {len(frames)} stocks")
@@ -67,6 +66,7 @@ def run_isolation_forest():
         for df in frames:
             ticker = df["_ticker"].iloc[0]
             df = df.drop(columns=["_ticker"])
+            df = df.drop(columns=["_is_train"])
 
             scores = model.score_samples(df[IF_FEATURES].values)
             threshold = np.percentile(scores, perc)
