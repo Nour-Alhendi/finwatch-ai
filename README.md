@@ -29,19 +29,18 @@ Traditional anomaly detection systems only flag unusual values but do not provid
 
 ## System Architecture
 
-The system follows a 9-layer modular pipeline:
+The system follows an 8-layer modular pipeline:
 
 | Layer | Name | Description |
 |-------|------|-------------|
-| 1 | Data Ingestion | Stooq API, 45 stocks, 10 years daily OHLCV |
+| 1 | Data Ingestion | Stooq API, 55 stocks, 10 years daily OHLCV |
 | 2 | Data Quality Checks | Missing values, duplicates, gaps, schema validation |
-| 3 | Feature Engineering | Returns, volatility, rolling stats, beta, correlation |
-| 4 | Anomaly Detection | Z-Score, Isolation Forest, Autoencoder — combined score + severity |
-| 5 | Contextual Validation | S&P 500, Sector ETFs, Market Regime (Bull/Bear/Transition) |
-| 6 | Prediction Corridor | LSTM (price prediction) + XGBoost (risk classification) |
-| 7 | Guardrails + AI Agent | Rule-based risk rules + LLM-powered decision support |
-| 8 | Reporting + XAI | Explainability, SHAP values, alerts |
-| 9 | Logging & Audit | Full audit trail of all decisions |
+| 3 | Feature Engineering | Basic (returns, volatility, RSI) + Context (regime, ETFs) + Advanced (momentum, lags) |
+| 4 | Anomaly Detection | Z-Score + Isolation Forest + Dual LSTM Autoencoder — combined score + severity |
+| 5 | Risk Prediction | XGBoost classifier — VaR-based labels, high/low risk per ticker |
+| 6 | Guardrails + Decision Engine | Rule-based decisions per ticker (fix / keep / escalate) |
+| 7 | Reporting + XAI | SHAP explainability, anomaly context, alerts |
+| 8 | Logging & Audit | Full audit trail of all decisions |
 
 ---
 
@@ -56,14 +55,13 @@ The system follows a 9-layer modular pipeline:
 
 ## Key Features
 
-- Multi-asset monitoring (45 stocks, 9 sectors)
+- Multi-asset monitoring (55 stocks, 10 sector ETFs)
 - Three-layer anomaly detection (Statistical + ML + Deep Learning)
-- Severity classification (minor / warning / critical)
-- Market context (is the anomaly market-wide or stock-specific?)
-- Market regime detection (Bull / Bear / Transition / Sideways)
-- Price prediction with LSTM
-- Risk classification with XGBoost
-- Explainability layer (XAI)
+- Severity classification (normal / watch / warning / critical)
+- Market context (market-wide vs sector-specific vs stock-specific anomaly)
+- Market regime detection (Bull / Bear / Transition)
+- Risk classification with XGBoost (VaR-based labels, high/low)
+- Explainability layer (XAI + SHAP)
 - Full audit logging
 
 ---

@@ -59,23 +59,36 @@ Description:     AI-Driven Financial Anomaly Detection
 ├── Severity:       normal / watch / warning / critical
 └── Output: data/detection/ parquet files
 
-# LAYER 5 – RISK PREDICTION
-├── XGBoost Classifier
-│   ├── Features: anomaly_score, returns, volatility, rsi,
-│   │             relative_return, trend_strength, momentum_5,
-│   │             vol_change, volume_zscore
-│   ├── Labels (forward-looking, 5 days):
-│   │   ├── low    → max drawdown < 1%
-│   │   ├── medium → max drawdown 1–3%
-│   │   └── high   → max drawdown > 3%
-│   └── Output: risk_level + p_low, p_medium, p_high per ticker
-└── Output: models/xgboost_risk.pkl
+# LAYER 5 – RISK & DIRECTION PREDICTION
+│
+├── 5A: XGBoost Risk Classifier
+│   ├── 35 features: anomaly signals, price/returns, context, volume
+│   ├── Labels (forward-looking, 5 days) — VaR-based, per ticker, no lookahead:
+│   │   ├── low  → max drawdown < 85th percentile
+│   │   └── high → max drawdown ≥ 85th percentile
+│   ├── Class imbalance handled via scale_pos_weight
+│   └── Output: risk_level + p_low, p_high per ticker
+│
+├── 5B: XGBoost Direction Classifier
+│   ├── Same 35 features as 5A
+│   ├── Labels (forward-looking, 5 days) — percentile-based, per ticker, no lookahead:
+│   │   ├── up     → future_return ≥ 75th percentile
+│   │   ├── down   → future_return ≤ 25th percentile
+│   │   └── stable → in between
+│   └── Output: direction + p_up, p_stable, p_down per ticker
+│
+└── Output: models/xgboost_risk.pkl + models/xgboost_direction.pkl
 
 # LAYER 6 – GUARDRAILS + DECISION ENGINE
-├── FIX:       auto-correct data issues
-├── KEEP:      flag but keep
-├── ESCALATE:  alert human
-└── Output: autonomous decision per ticker
+├── Input: risk_level (high/low) × direction (up/stable/down)
+├── Decision matrix:
+│   ├── high risk + down   → CRITICAL (escalate immediately)
+│   ├── high risk + stable → WARNING  (monitor closely)
+│   ├── high risk + up     → WATCH    (possible recovery)
+│   ├── low risk  + down   → WATCH    (minor concern)
+│   └── low risk  + stable/up → NORMAL
+├── Actions: FIX / KEEP / ESCALATE per ticker
+└── Output: final decision + severity per ticker
 
 # LAYER 7 – REPORTING + XAI
 ├── Automatic report per ticker
