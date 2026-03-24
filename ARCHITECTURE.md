@@ -25,7 +25,7 @@ Description:     AI-Driven Financial Anomaly Detection
 │
 ├── 3A: Basic Features
 │   ├── returns, volatility
-│   ├── rolling_mean, rolling_std (20d + 60d)
+│   ├── rolling_mean, rolling_std (20d)
 │   ├── beta, corr_spx
 │   └── rsi
 │
@@ -61,20 +61,28 @@ Description:     AI-Driven Financial Anomaly Detection
 
 # LAYER 5 – RISK & DIRECTION PREDICTION
 │
-├── 5A: XGBoost Risk Classifier
-│   ├── 35 features: anomaly signals, price/returns, context, volume
+├── 5A: Expected Shortfall
+│   ├── Rolling 252-day VaR (95%) + ES per ticker
+│   ├── ES captures tail risk — not the same as volatility:
+│   │   └── same volatility, very different ES → different danger level
+│   ├── Columns: var_95, es_95, es_ratio (ES/VaR)
+│   └── Output: written to detection parquets + data/risk/ snapshot
+│
+├── 5B: XGBoost Risk Classifier
+│   ├── 38 features: anomaly signals, price/returns, context, volume, ES (var_95, es_95, es_ratio)
 │   ├── Labels (forward-looking, 5 days) — VaR-based, per ticker, no lookahead:
 │   │   ├── low  → max drawdown < 85th percentile
 │   │   └── high → max drawdown ≥ 85th percentile
 │   ├── Class imbalance handled via scale_pos_weight
 │   └── Output: risk_level + p_low, p_high per ticker
 │
-├── 5B: XGBoost Direction Classifier
-│   ├── Same 35 features as 5A
+├── 5C: XGBoost Direction Classifier
+│   ├── 38 features: same as 5B
 │   ├── Labels (forward-looking, 5 days) — percentile-based, per ticker, no lookahead:
 │   │   ├── up     → future_return ≥ 75th percentile
 │   │   ├── down   → future_return ≤ 25th percentile
 │   │   └── stable → in between
+│   ├── Class imbalance handled via sample_weight="balanced"
 │   └── Output: direction + p_up, p_stable, p_down per ticker
 │
 └── Output: models/xgboost_risk.pkl + models/xgboost_direction.pkl

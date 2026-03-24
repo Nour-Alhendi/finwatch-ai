@@ -37,7 +37,7 @@ The system follows an 8-layer modular pipeline:
 | 2 | Data Quality Checks | Missing values, duplicates, gaps, schema validation |
 | 3 | Feature Engineering | Basic (returns, volatility, RSI) + Context (regime, ETFs) + Advanced (momentum, lags) |
 | 4 | Anomaly Detection | Z-Score + Isolation Forest + Dual LSTM Autoencoder — combined score + severity |
-| 5 | Risk Prediction | XGBoost classifier — VaR-based labels, high/low risk per ticker |
+| 5 | Risk & Direction Prediction | XGBoost Risk (VaR-based, high/low) + XGBoost Direction (up/stable/down) |
 | 6 | Guardrails + Decision Engine | Rule-based decisions per ticker (fix / keep / escalate) |
 | 7 | Reporting + XAI | SHAP explainability, anomaly context, alerts |
 | 8 | Logging & Audit | Full audit trail of all decisions |
@@ -47,8 +47,8 @@ The system follows an 8-layer modular pipeline:
 ## Data Sources
 
 - **Stooq** — historical daily OHLCV data (primary source)
-- **45 stocks** across 9 sectors (Technology, AI & Robotics, Financials, Healthcare, Consumer Staples, Energy, Consumer Discretionary, Industrials, Green Energy)
-- **9 Sector ETFs** — XLK, BOTZ, XLF, XLV, XLP, XLE, XLY, XLI, ICLN
+- **55 stocks** across 9 sectors (Technology, AI & Robotics, Financials, Healthcare, Consumer Staples, Energy, Consumer Discretionary, Industrials, Green Energy)
+- **10 Sector ETFs** — XLK, BOTZ, XLF, XLV, XLP, XLE, XLY, XLI, ICLN, ^SPX
 - **Reference Index** — ^SPX (S&P 500)
 
 ---
@@ -61,6 +61,8 @@ The system follows an 8-layer modular pipeline:
 - Market context (market-wide vs sector-specific vs stock-specific anomaly)
 - Market regime detection (Bull / Bear / Transition)
 - Risk classification with XGBoost (VaR-based labels, high/low)
+- Direction prediction with XGBoost (up/stable/down, 5-day horizon)
+- Expected Shortfall (VaR 95% + ES tail risk per ticker)
 - Explainability layer (XAI + SHAP)
 - Full audit logging
 
@@ -86,19 +88,23 @@ ai-monitoring-system/
 │   ├── raw/                 # Downloaded OHLCV data
 │   ├── features/            # Engineered features
 │   ├── detection/           # Anomaly detection results
-│   └── context/             # Contextual validation results
+│   ├── context/             # Contextual validation results
+│   └── risk/                # ES snapshots for Layer 6 (Decision Engine)
 ├── src/
 │   ├── ingestion/           # Layer 1: Data download
 │   ├── quality/             # Layer 2: Quality checks
 │   ├── features/            # Layer 3: Feature engineering
 │   ├── detection/           # Layer 4: Anomaly detection
-│   ├── context/             # Layer 5: Contextual validation
-│   ├── prediction/          # Layer 6: LSTM + XGBoost (WIP)
-│   ├── decision/            # Layer 7: Guardrails + AI Agent (WIP)
-│   ├── reporting/           # Layer 8: XAI + Reporting (WIP)
+│   ├── prediction/          # Layer 5: Risk & Direction prediction
+│   │   ├── expected_shortfall.py    # VaR + ES tail risk (writes to detection parquets)
+│   │   ├── prediction_pipeline.py   # Orchestrates ES → Risk → Direction
+│   │   ├── xgboost_risk.py          # High/low risk classifier
+│   │   └── xgboost_direction.py     # up/stable/down direction classifier
+│   ├── decision/            # Layer 6: Guardrails + Decision engine
+│   ├── reporting/           # Layer 7: XAI + Reporting (WIP)
 │   └── pipeline.py          # Main entry point
 ├── notebooks/               # Exploration and analysis
-└── ARCHITEKTURE.md          # Detailed architecture documentation
+└── ARCHITECTURE.md          # Detailed architecture documentation
 ```
 
 ---
