@@ -40,10 +40,12 @@ def fetch_news(ticker: str, limit: int = 3, retries: int = 3) -> list[str]:
     if not FINNHUB_API_KEY:
         return []
 
+    from datetime import date, timedelta
+    today = date.today()
     params = {
         "symbol": ticker,
-        "from":   "2026-03-01",
-        "to":     "2026-03-25",
+        "from":   (today - timedelta(days=30)).isoformat(),
+        "to":     today.isoformat(),
         "token":  FINNHUB_API_KEY,
     }
 

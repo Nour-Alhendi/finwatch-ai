@@ -1,166 +1,216 @@
-# FinWatch AI
-––––––––––––––
+# FinWatch AI — System Architecture
 
-Product Name:    FinWatch AI
-GitHub Repo:     finwatch-ai
-Description:     AI-Driven Financial Anomaly Detection
-                 and Monitoring System
+**AI-Driven Financial Anomaly Detection and Monitoring System**
 
+---
 
+## Overview
 
-# LAYER 1 – DATA INGESTION
-├── Stooq API (historical, 10 years, daily)
-├── 55 Stocks, OHLCV (Tech, Finance, Health, Energy, Industrials, Green Energy)
-├── 10 Reference ETFs (SPX, XLK, XLF, XLV, XLP, XLE, XLY, XLI, BOTZ, ICLN)
-└── Output: raw_clean parquet files (data/raw/raw_clean/)
+An 8-layer modular pipeline that monitors 55 stocks and 10 sector ETFs, detects anomalies, classifies risk, and explains every decision in plain English.
 
-# LAYER 2 – DATA QUALITY CHECKS
-├── Schema validation
-├── Missing values
-├── Duplicates
-├── OHLC violations
-└── Output: validated parquet files
+---
 
-# LAYER 3 – FEATURE ENGINEERING
-│
-├── 3A: Basic Features
-│   ├── returns, volatility
-│   ├── rolling_mean, rolling_std (20d)
-│   ├── beta, corr_spx
-│   ├── rsi
-│   └── max_drawdown_30d (rolling 30-day peak-to-trough, no lookahead)
-│
-├── 3B: Context Features
-│   ├── spx_return, etf_return
-│   ├── is_market_wide, is_sector_wide   (pure market signal, no anomaly)
-│   ├── excess_return, relative_return, sector_relative
-│   ├── regime (bull/bear/transition), ma50, ma200, regime_encoded
-│   └── vol_regime, volume_ma20, volume_zscore, is_high_volume
-│
-└── 3C: Advanced Features
-    ├── return_lag_1/2/3, momentum_5/10
-    ├── vol_5, vol_20, vol_change
-    ├── trend_strength
-    ├── volatility_ratio (vs SPX)
-    └── volume_trend
+## Layer 1 — Data Ingestion
 
-# LAYER 4 – ANOMALY DETECTION
-│
-├── Statistical:    Z-Score (±3σ, 20d + 60d window)
-├── ML:             Isolation Forest (group-aware, percentile threshold per group)
-├── Deep Learning:  Dual LSTM Autoencoder
-│   ├── low_vol_model  → trained on calm periods per group
-│   ├── high_vol_model → trained on volatile periods per group
-│   └── regime-specific thresholds from train data only (no lookahead)
-├── Combine:
-│   ├── anomaly_score (0–4): z + z_60 + if + ae
-│   ├── combined_anomaly (bool)
-│   ├── market_anomaly  = is_market_wide  & combined_anomaly
-│   └── sector_anomaly  = is_sector_wide  & combined_anomaly
-├── Severity:       normal / watch / warning / critical
-└── Output: data/detection/ parquet files
+- **Source:** Stooq API (historical, 10 years, daily)
+- **Universe:** 55 stocks (Tech, Finance, Health, Energy, Industrials, Green Energy) + 10 reference ETFs (SPX, XLK, XLF, XLV, XLP, XLE, XLY, XLI, BOTZ, ICLN)
+- **Format:** OHLCV (Open, High, Low, Close, Volume)
+- **Output:** `data/raw/raw_clean/` — one parquet file per ticker
 
-# LAYER 5 – RISK & DIRECTION PREDICTION
-│
-├── 5A: Prediction Features (src/prediction/features/)
-│   ├── Expected Shortfall (expected_shortfall.py):
-│   │   ├── Rolling 252-day VaR (95%) + ES per ticker
-│   │   ├── ES captures tail risk — not the same as volatility:
-│   │   │   └── same volatility, very different ES → different danger level
-│   │   └── Columns: var_95, es_95, es_ratio (ES/VaR)
-│   ├── OBV Signal (obv_signal.py):
-│   │   ├── obv_signal = volume_zscore × returns
-│   │   ├── positive → high volume + positive return = institutional buying
-│   │   ├── negative → high volume + negative return = panic selling
-│   │   └── Used in: Decision Layer (sanity check) + Narrative Engine (confirmation)
-│   └── Output: written to detection parquets + data/risk/ snapshot
-│
-├── 5B: XGBoost Risk Classifier (src/prediction/models/xgboost_risk.py)
-│   ├── 29 features: anomaly signals, price/returns, context, volume, ES (var_95, es_95, es_ratio)
-│   ├── Labels (forward-looking, 5 days) — VaR-based, per ticker, no lookahead:
-│   │   ├── low  → max drawdown < 85th percentile
-│   │   └── high → max drawdown ≥ 85th percentile
-│   ├── Class imbalance handled via scale_pos_weight
-│   └── Output: risk_level + p_low, p_high per ticker
-│
-├── 5C: XGBoost Direction Classifier (src/prediction/models/xgboost_direction.py)
-│   ├── 29 features: same as 5B
-│   ├── Labels (forward-looking, 5 days) — percentile-based, per ticker, no lookahead:
-│   │   ├── up     → future_return ≥ 75th percentile
-│   │   ├── down   → future_return ≤ 25th percentile
-│   │   └── stable → in between
-│   ├── Class imbalance handled via sample_weight="balanced"
-│   └── Output: direction + p_up, p_stable, p_down per ticker
-│
-└── Output: models/xgboost_risk.pkl + models/xgboost_direction.pkl
+---
 
-# LAYER 6 – GUARDRAILS + DECISION ENGINE
-├── Input: risk_level (high/low) × direction (up/stable/down) × anomaly signals × ES ratio × drawdown
-│
-├── Priority order:
-│   ├── 1. Hard Override    — max_drawdown_30d ≤ -5% → always CRITICAL
-│   ├── 2. REVIEW           — anomaly_score=0 + risk=high (models contradict)
-│   ├── 3. ES Ratio Override — risk=high + es_ratio ≥ 1.5 → WARNING (regardless of model confidence)
-│   ├── 4. Core Matrix      — risk=high + p_high ≥ 0.60:
-│   │   ├── high + down (confirmed)   → CRITICAL
-│   │   ├── high + down (weak)        → WARNING
-│   │   ├── high + stable             → WARNING
-│   │   └── high + up                 → WATCH (Dead Cat Bounce flag)
-│   ├── 5. Confidence Catch — risk=high + p_high < 0.60 → WATCH (no silent fallthrough)
-│   ├── 6. Low Risk:
-│   │   ├── low + up + rising momentum → POSITIVE_MOMENTUM
-│   │   └── low + down (confirmed)     → WATCH
-│   └── 7. Default          → NORMAL
-│
-├── Severity levels: CRITICAL / WARNING / WATCH / NORMAL / POSITIVE_MOMENTUM / REVIEW
-├── Actions: ESCALATE / MONITOR / OBSERVE / NONE / FLAG
-└── Output: final decision + severity + confidence + context + summary per ticker
+## Layer 2 — Data Quality Checks
 
-# LAYER 7 – XAI + NARRATIVE ENGINE + REPORTING
-│
-├── 7A: XAI — SHAP (src/explainability/xai.py)
-│   ├── TreeExplainer on XGBoost Risk model
-│   ├── Top-3 SHAP drivers per ticker (excludes context features)
-│   └── Output: data/explanations/explanations.parquet
-│
-├── 7B: Narrative Engine (src/explainability/narrative_engine.py)
-│   ├── Inputs: Decision (Layer 6) + SHAP Top-3 + OBV Signal
-│   ├── driver       = Top-1 SHAP Feature (primary risk driver)
-│   ├── confirmation = OBV direction (sell_pressure / buy_pressure / neutral)
-│   ├── conflict     = obv_contradicts_severity | obv_signals_hidden_risk | None
-│   └── narrative patterns:
-│       ├── signals_aligned_bearish  — CRITICAL + OBV negative + driver↑risk
-│       ├── signals_aligned_bullish  — NORMAL/WATCH + OBV positive + driver↓risk
-│       ├── conflict_dead_cat_bounce — CRITICAL/WARNING + OBV strongly positive
-│       ├── blind_spot_review        — NORMAL/WATCH + OBV strongly negative
-│       └── mixed                   — no dominant pattern
-│
-├── 7C: LLM Narrator (src/explainability/llm_narrator.py)
-│   ├── Input: Narrative Engine output (structured)
-│   └── Output: Plain-English summary per ticker
-│
-├── 7D: FinBERT (src/explainability/finbert.py)
-│   ├── Financial sentiment analysis on news headlines
-│   └── Output: sentiment scores per ticker (positive / neutral / negative)
-│
-└── 7E: Report (src/explainability/report.py)
-    ├── Per ticker: Severity + SHAP Top-3 + OBV + LLM Summary + News Sentiment
-    └── Output: data/explanations/llm_news_enriched.parquet
+| Check | What it catches |
+|-------|----------------|
+| Schema validation | Wrong column types or missing columns |
+| Missing values | NaN, -999, zero-price rows |
+| Duplicates | Exact copies or date conflicts |
+| OHLC violations | High < Low, Open > High, Close < Low |
+| Gap detection | Missing trading days |
 
-# LAYER 8 – LOGGING & AUDIT (src/reporting/)
-│
-├── 8A: Anomaly Log (anomaly_log.py)
-│   ├── Appends every pipeline run with UUID + timestamp
-│   ├── Columns: run_id, timestamp, ticker, date, severity, action, confidence, context
-│   └── Output: data/logs/anomaly_log.parquet
-│
-└── 8B: Daily Report (daily_report.py)
-    ├── Management-level summary per run
-    ├── Severity breakdown + ESCALATE / MONITOR / POSITIVE_MOMENTUM tiers
-    └── Output: data/reports/daily_summary.txt
+- **Output:** Validated parquet files
 
-# STRESS TESTING (src/stress_testing/)
-├── 11 data corruption scenarios (missing values, price spikes, OHLC violations, etc.)
-├── Injection rates per scenario (0.3% – 2%)
-├── Input:  data/raw/raw_clean/
-└── Output: data/raw/raw_corrupted/ + data_quality_alert column
+---
+
+## Layer 3 — Feature Engineering
+
+### 3A · Basic Features
+- `returns`, `volatility`
+- `rolling_mean`, `rolling_std` (20-day window)
+- `beta`, `corr_spx`
+- `rsi`
+- `max_drawdown_30d` — rolling 30-day peak-to-trough, no lookahead
+
+### 3B · Context Features
+- `spx_return`, `etf_return`
+- `is_market_wide`, `is_sector_wide` — pure market signal, no anomaly label
+- `excess_return`, `relative_return`, `sector_relative`
+- `regime` (bull / bear / transition), `ma50`, `ma200`, `regime_encoded`
+- `vol_regime`, `volume_ma20`, `volume_zscore`, `is_high_volume`
+
+### 3C · Advanced Features
+- `return_lag_1/2/3`, `momentum_5/10`
+- `vol_5`, `vol_20`, `vol_change`
+- `trend_strength`
+- `volatility_ratio` (vs SPX)
+- `volume_trend`
+
+---
+
+## Layer 4 — Anomaly Detection
+
+### Detection Methods
+
+| Method | Details |
+|--------|---------|
+| **Statistical** | Z-Score ±3σ, 20-day + 60-day window |
+| **ML** | Isolation Forest — group-aware, percentile threshold per group |
+| **Deep Learning** | Dual LSTM Autoencoder — `low_vol_model` (calm periods) + `high_vol_model` (volatile periods), regime-specific thresholds from train data only (no lookahead) |
+
+### Combined Score
+
+- `anomaly_score` (0–4): z + z_60 + isolation_forest + autoencoder
+- `combined_anomaly` (bool)
+- `market_anomaly` = `is_market_wide` & `combined_anomaly`
+- `sector_anomaly` = `is_sector_wide` & `combined_anomaly`
+
+### Severity
+`normal` → `watch` → `warning` → `critical`
+
+- **Output:** `data/detection/` — one parquet per ticker
+
+---
+
+## Layer 5 — Risk & Direction Prediction
+
+### 5A · Prediction Features (`src/prediction/features/`)
+
+**Expected Shortfall** (`expected_shortfall.py`)
+- Rolling 252-day VaR (95%) + ES per ticker
+- ES captures tail risk independently of volatility — same volatility can mean very different danger levels
+- Columns added: `var_95`, `es_95`, `es_ratio` (ES / VaR)
+
+**OBV Signal** (`obv_signal.py`)
+- `obv_signal = volume_zscore × returns`
+- Positive → high volume + positive return = institutional buying
+- Negative → high volume + negative return = panic selling / distribution
+- Used in: Decision Layer (sanity check) + Narrative Engine (confirmation)
+
+### 5B · XGBoost Risk Classifier (`src/prediction/models/xgboost_risk.py`)
+
+- **Task:** Binary classification — `high` risk vs `low` risk
+- **Features:** 29 (anomaly signals, price/returns, momentum, context, volume, ES)
+- **Labels:** Forward-looking 5-day max drawdown vs 85th percentile per ticker (no lookahead)
+- **Class imbalance:** `scale_pos_weight`
+- **Output:** `risk_level`, `p_high`, `p_low` per ticker
+
+### 5C · XGBoost Direction Classifier (`src/prediction/models/xgboost_direction.py`)
+
+- **Task:** Multiclass — `up` / `stable` / `down`
+- **Features:** Same 29 features as 5B
+- **Labels:** Forward-looking 5-day return vs 75th / 25th percentile per ticker (no lookahead)
+- **Class imbalance:** Balanced sample weights
+- **Output:** `direction`, `p_up`, `p_stable`, `p_down` per ticker
+
+- **Saved models:** `models/xgboost_risk.pkl`, `models/xgboost_direction.pkl`
+
+---
+
+## Layer 6 — Guardrails + Decision Engine
+
+**Input:** `risk_level` × `direction` × `anomaly_score` × `es_ratio` × `max_drawdown_30d`
+
+### Priority Order
+
+| Priority | Condition | Outcome |
+|----------|-----------|---------|
+| 1 | `max_drawdown_30d ≤ −5%` | **CRITICAL** (hard override) |
+| 2 | `anomaly_score = 0` + `risk = high` | **REVIEW** (models contradict each other) |
+| 3 | `risk = high` + `es_ratio ≥ 1.5` | **WARNING** (tail risk override) |
+| 4a | `risk = high` + `p_high ≥ 0.60` + `down` (confirmed) | **CRITICAL** |
+| 4b | `risk = high` + `p_high ≥ 0.60` + `down` (weak) | **WARNING** |
+| 4c | `risk = high` + `p_high ≥ 0.60` + `stable` | **WARNING** |
+| 4d | `risk = high` + `p_high ≥ 0.60` + `up` | **WATCH** *(Dead Cat Bounce flag)* |
+| 5 | `risk = high` + `p_high < 0.60` | **WATCH** (low confidence catch) |
+| 6a | `risk = low` + `up` + rising momentum | **POSITIVE_MOMENTUM** |
+| 6b | `risk = low` + `down` (confirmed) | **WATCH** |
+| 7 | Default | **NORMAL** |
+
+### Outputs
+
+- **Severity:** `CRITICAL` / `WARNING` / `WATCH` / `NORMAL` / `POSITIVE_MOMENTUM` / `REVIEW`
+- **Action:** `ESCALATE` / `MONITOR` / `OBSERVE` / `NONE` / `FLAG`
+- **Confidence:** derived from `anomaly_score`
+- **Context:** `market_wide` / `sector_wide` / `idiosyncratic`
+- **Output:** `data/decisions/decisions.parquet`
+
+---
+
+## Layer 7 — XAI + Narrative Engine + Reporting
+
+### 7A · SHAP Explainability (`src/explainability/xai.py`)
+- TreeExplainer on XGBoost Risk model
+- Top-3 SHAP drivers per ticker (context features excluded to show stock-specific signals)
+- **Output:** `data/explanations/explanations.parquet`
+
+### 7B · Narrative Engine (`src/explainability/narrative_engine.py`)
+
+**Inputs:** Decision (Layer 6) + SHAP Top-3 + OBV Signal
+
+| Pattern | Condition |
+|---------|-----------|
+| `signals_aligned_bearish` | CRITICAL + OBV negative + driver pushes risk up |
+| `signals_aligned_bullish` | NORMAL/WATCH + OBV positive + driver pulls risk down |
+| `conflict_dead_cat_bounce` | CRITICAL/WARNING + OBV strongly positive |
+| `blind_spot_review` | NORMAL/WATCH + OBV strongly negative |
+| `mixed` | No dominant pattern |
+
+### 7C · LLM Narrator (`src/explainability/llm_narrator.py`)
+- Input: structured Narrative Engine output
+- Output: plain-English summary per ticker (grounded — no hallucination possible)
+
+### 7D · FinBERT (`src/explainability/finbert.py`)
+- Financial sentiment analysis on news headlines
+- Output: `positive` / `neutral` / `negative` sentiment score per ticker
+
+### 7E · Report (`src/explainability/report.py`)
+- Per ticker: Severity + SHAP Top-3 + OBV + LLM Summary + News Sentiment
+- **Output:** `data/explanations/llm_news_enriched.parquet`
+
+---
+
+## Layer 8 — Logging & Audit (`src/reporting/`)
+
+### 8A · Anomaly Log (`anomaly_log.py`)
+- Appends every pipeline run with a UUID + timestamp
+- Columns: `run_id`, `timestamp`, `ticker`, `date`, `severity`, `action`, `confidence`, `context`
+- **Output:** `data/logs/anomaly_log.parquet`
+
+### 8B · Daily Report (`daily_report.py`)
+- Management-level summary per run
+- Sections: severity breakdown, ESCALATE tier, MONITOR tier, POSITIVE_MOMENTUM tier
+- **Output:** `data/reports/daily_summary.txt`
+
+---
+
+## Stress Testing (`src/stress_testing/`)
+
+11 data corruption scenarios injected at controlled rates to validate the quality pipeline:
+
+| Scenario | Rate |
+|----------|------|
+| Missing values (NaN / -999) | 2% |
+| Price spikes (×10, ×0.01, +1000) | 1% |
+| Zero values (clustered blocks) | 1% |
+| Duplicate rows | 1% |
+| Wrong dates (±30d, ±365d, weekends) | 0.5% |
+| Stale prices (frozen feed, 3–5 rows) | 1% |
+| OHLC violations (High < Low, etc.) | 0.5% |
+| Zero volume | 1% |
+| Extreme overnight gaps (−80–90%) | 0.3% |
+| Negative volume | 0.5% |
+| Timestamp conflicts (same date, diff Close) | 0.5% |
+
+- **Input:** `data/raw/raw_clean/`
+- **Output:** `data/raw/raw_corrupted/` + `data_quality_alert` column
