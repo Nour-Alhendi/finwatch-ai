@@ -1,13 +1,13 @@
 """
 FinWatch AI — Layer 7A: XAI (SHAP)
 ====================================
-Loads XGBoost Risk model, computes SHAP values for the latest
+Loads XGBoost Drawdown model, computes SHAP values for the latest
 row per ticker, and returns (latest_df, shap_matrix).
 
 shap_matrix shape: (n_tickers, n_features)
-Values: SHAP for the 'high' risk class
-  positive → feature pushes model toward HIGH risk
-  negative → feature pushes model toward LOW risk
+Values: SHAP for the drawdown class (positive = pushes toward drawdown risk)
+  positive → feature increases drawdown probability
+  negative → feature reduces drawdown probability
 """
 
 import joblib
@@ -25,10 +25,9 @@ def compute(data: pd.DataFrame, features: list[str]) -> tuple[pd.DataFrame, np.n
     Returns (latest_df, shap_matrix).
 
     latest_df   — one row per ticker (most recent)
-    shap_matrix — shape (n_tickers, n_features), SHAP for 'high' risk class
+    shap_matrix — shape (n_tickers, n_features), SHAP for drawdown probability
     """
-    model = joblib.load(MODEL_DIR / "xgboost_risk.pkl")
-    le    = joblib.load(MODEL_DIR / "risk_label_encoder.pkl")
+    model = joblib.load(MODEL_DIR / "xgboost_drawdown.pkl")
 
     latest = data.groupby("ticker").last().reset_index()
 
@@ -37,14 +36,12 @@ def compute(data: pd.DataFrame, features: list[str]) -> tuple[pd.DataFrame, np.n
     explainer   = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)
 
-    # Binary XGBoost: shap_values can be 2D or 3D — always extract 'high' class
-    classes = list(le.classes_)
-    high_idx = next(
-        (i for i, c in enumerate(classes) if str(c).lower() == "high"),
-        len(classes) - 1,  # fallback: last class
-    )
-    if shap_values.ndim == 3:
-        sv = shap_values[:, :, high_idx]
+    # Binary XGBoost: shap_values is 2D (n_samples, n_features)
+    # For 3D output (older XGBoost), take index 1 (positive/drawdown class)
+    if isinstance(shap_values, list):
+        sv = shap_values[1]
+    elif shap_values.ndim == 3:
+        sv = shap_values[:, :, 1]
     else:
         sv = shap_values
 

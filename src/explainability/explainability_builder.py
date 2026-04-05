@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from prediction.models.xgboost_risk import load_data, FEATURES
+from prediction.models.drawdown_probability import load_data, FEATURES
 import explainability.xai as xai
 import explainability.narrative_engine as narrative_engine
 
