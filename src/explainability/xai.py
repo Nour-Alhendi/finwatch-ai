@@ -32,13 +32,7 @@ def compute(data: pd.DataFrame, features: list[str]) -> tuple[pd.DataFrame, np.n
 
     latest = data.groupby("ticker").last().reset_index()
 
-    bool_cols = latest[features].select_dtypes(include="bool").columns
-    latest[bool_cols] = latest[bool_cols].astype(int)
-    X = (
-        latest[features]
-        .apply(lambda col: col.astype(float) if col.dtype.name == "category" else col)
-        .fillna(0)
-    )
+    X = latest[features].apply(lambda c: pd.to_numeric(c, errors="coerce")).fillna(0)
 
     explainer   = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)

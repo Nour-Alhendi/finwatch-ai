@@ -1,528 +1,583 @@
 """
-FinWatch AI — Layer 6: Decision Engine
-=======================================
-Core logic: Risk X Direction → Base Severity
-Anomaly Score → Confidence only (not severity driver)
-Hard Overrides → Drawdown threshold, REVIEW
+FinWatch AI — Layer 6: Decision Engine (v2)
+============================================
+Clean, anomaly-first design. No direction forecasting.
 
-Design Principles:
-    1. Anomaly = signal (FLAG) to "look closer", not an action trigger
-    2. Final decision = Risk X Direction
-    3. Anomaly Score = confidence modifier only
-    4. Every decision is auditable and traceable
+Primary signals (in order of reliability):
+  1. anomaly_score_weighted  — 4-model ensemble, weighted (most reliable)
+  2. p_drawdown              — ML probability of >5% drawdown in 20 days (AUC 0.64)
+  3. drawdown (30d actual)   — already happened, hard fact
+  4. RSI + momentum          — technical confirmation
+  5. news_sentiment_score    — soft signal (Groq contextual)
+  6. excess_return           — vs market (filters false positives)
 
 Severity Levels:
-    CRITICAL          — Immediate action required
-    WARNING           — Elevated risk, monitor closely
-    WATCH             — Low-level signal, observe
-    NORMAL            — No significant signal
-    POSITIVE_MOMENTUM — Strong upside with controlled risk
-    REVIEW            — Conflicting signals, analyst check needed
+  CRITICAL         — Multiple strong signals align: high anomaly + high p_drawdown
+  WARNING          — Elevated risk, 1-2 strong signals
+  WATCH            — Single weak signal, monitor
+  NORMAL           — No significant signals
+  POSITIVE_SIGNAL  — Low drawdown risk + positive technicals
+  REVIEW           — Conflicting signals
 
-Actions:
-    ESCALATE  — Report to management immediately
-    MONITOR   — Track closely, prepare for action
-    OBSERVE   — Keep in watchlist
-    NONE      — No action needed
-    FLAG      — Manual analyst review required
+Confidence:
+  Based on signal agreement, not on broken ML model probabilities.
+  Will be replaced by historical_precision after backtesting.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
+from pathlib import Path
+import pandas as pd
+
+_ROOT         = Path(__file__).resolve().parents[2]
+_PRECISION_PATH = _ROOT / "data/backtesting/signal_precision.parquet"
+
+# Historical precision from walk-forward backtest (fallback values if file missing)
+# Loaded once at import time; keys = severity label
+_HISTORICAL_PRECISION: dict = {}
+
+def _load_precision():
+    global _HISTORICAL_PRECISION
+    if not _PRECISION_PATH.exists():
+        return
+    df = pd.read_parquet(_PRECISION_PATH)
+    mp = dict(zip(df["signal"], df["precision"]))
+    _HISTORICAL_PRECISION = {
+        "CRITICAL":        mp.get("severity_critical", 0.48),
+        "WARNING":         max(mp.get("severity_warning",  0.36) - mp.get("severity_critical", 0.48) * 0.35, 0.30),
+        "WATCH":           0.28,
+        "REVIEW":          0.28,
+        "NORMAL":          1.0 - mp.get("severity_warning", 0.36),   # precision of "no event"
+        "POSITIVE_SIGNAL": 1.0 - mp.get("severity_warning", 0.36),
+    }
+
+_load_precision()
 
 
-# ── Constants ─────────────
+# ── Thresholds ─────────────────────────────────────────────────────────────
 
-# Hard override thresholds — used as CAPS in the dynamic formula:
-#   DRAWDOWN_WARNING  = max(-0.08, -1 * vol)   → tighter for calm stocks, capped at -8% for volatile
-#   DRAWDOWN_CRITICAL = max(-0.15, -2 * vol)   → tighter for calm stocks, capped at -15% for volatile
-# Stored as fallback caps; actual per-ticker thresholds computed in decide() using inp.volatility.
+# Drawdown probability thresholds
+P_DRAWDOWN_CRITICAL = 0.60   # >60% chance of 5%+ drawdown → CRITICAL signal
+P_DRAWDOWN_WARNING  = 0.45   # >45% → WARNING signal
+P_DRAWDOWN_LOW      = 0.30   # <30% + good technicals → POSITIVE
+
+# Anomaly weighted score thresholds
+ANOMALY_STRONG  = 0.50   # AE + IF both flagged → strong
+ANOMALY_MEDIUM  = 0.30   # at least one ML model flagged
+ANOMALY_WEAK    = 0.20   # only z-score flagged
+
+# Drawdown (actual 30d) thresholds — dynamic per volatility
 DRAWDOWN_WARNING_CAP  = -0.08
 DRAWDOWN_CRITICAL_CAP = -0.15
 
-# Relative risk threshold
-# Stock must meaningfully underperform the market to keep CRITICAL in a broad selloff.
-EXCESS_RETURN_CRITICAL = -0.05  # stock must underperform market by >5% to keep CRITICAL
+# RSI
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD   = 30
 
-# Direction confidence thresholds (from XGBoost)
-P_DOWN_THRESHOLD    = 0.65      # minimum p_down to treat direction=down seriously
-P_HIGH_THRESHOLD    = 0.65      # minimum p_high to treat risk=high seriously
+# Tail risk
+ES_RATIO_HIGH = 2.0
 
-# Positive momentum thresholds
-P_DOWN_LOW          = 0.30      # p_down must be low for POSITIVE_MOMENTUM
-RSI_OVERBOUGHT      = 70
-RSI_OVERSOLD        = 30
-
-# ES ratio threshold for tail risk
-ES_RATIO_HIGH       = 2.0       # raised from 1.5 — tail risk fires only on genuine extremes
+# News sentiment
+SENTIMENT_NEGATIVE = -0.10
+SENTIMENT_POSITIVE = +0.10
 
 
-# ── Data Classes ───────────
+# ── Data Classes ────────────────────────────────────────────────────────────
 
 @dataclass
 class AnomalyInput:
-    """
-    Structured input for one ticker/date decision.
-    All fields come directly from Layer 4 + Layer 5 outputs.
-    """
-    ticker:         str
-    date:           str
+    ticker:                 str
+    date:                   str
 
-    # Risk Classifier (XGBoost)
-    risk_level:     str           # "high" / "low"
-    p_high:         float         # XGBoost confidence for risk=high (0-1)
+    # Drawdown Probability Model
+    p_drawdown:             float = 0.35   # P(drawdown > 5% in 20 days)
+    drawdown_risk:          str   = "low"  # "high" / "low"
 
-    # Direction Classifier (XGBoost)
-    direction:      str           # "up" / "stable" / "down"
-    p_down:         float         # XGBoost confidence for direction=down (0-1)
-    p_up:           float         # XGBoost confidence for direction=up (0-1)
+    # Anomaly Detection
+    anomaly_score:          int   = 0      # 0–4 (integer, backward compat)
+    anomaly_score_weighted: float = 0.0    # 0–1 weighted score
+    market_anomaly:         bool  = False
+    sector_anomaly:         bool  = False
 
-    # Anomaly Detection (zscore, Isolation Forest, LSTM Autoencoder)
-    anomaly_score:  int           # 0-4 (how many models flagged)
-    market_anomaly: bool          # True if movement is market-wide
-    sector_anomaly: bool          # True if movement is sector-wide
+    # Technical signals
+    rsi:            float = 50.0
+    momentum_5:     float = 0.0
+    momentum_10:    float = 0.0
+    drawdown:       float = 0.0    # actual 30d max drawdown (negative)
+    obv_signal:     float = 0.0
+    volatility:     float = 0.02
+    excess_return:  float = 0.0
+    es_ratio:       float = 1.0
+    vix_level:      float = 20.0   # current VIX — used for regime-aware thresholds
 
-    # Expected Shortfall
-    es_ratio:       float         # ES/VaR ratio — tail risk intensity
+    # News sentiment (Groq + VADER)
+    vader_score:          float = 0.0
+    finbert_score:        float = 0.0
+    news_sentiment_score: float = 0.0
 
-    # Features (for momentum signal)
-    rsi:            float         # 0-100
-    momentum_5:     float         # 5-day momentum
-    momentum_10:    float         # 10-day momentum
+    # Fundamental signals (optional — loaded from data/fundamental/)
+    days_to_next_earnings: Optional[int]   = None   # None = unknown
+    insider_sentiment:     float           = 0.0    # -1 heavy selling … +1 heavy buying
+    put_call_ratio:        float           = 0.85   # market avg ~0.85; >1.0 = fear
+    options_fear:          int             = 0      # 1 if put_call_ratio > 1.0
 
-    # Rolling max drawdown — from Layer 3 feature (max_drawdown_30d)
-    drawdown:       float         # negative float, e.g. -0.04 = -4% (worst peak-to-trough, 30d)
+    # Valuation signals (optional — loaded from data/fundamental/valuation.parquet)
+    pe_ratio:       Optional[float] = None   # trailing P/E; None = unknown / not profitable
+    pe_forward:     Optional[float] = None   # forward P/E; None = unknown
+    pb_ratio:       Optional[float] = None   # price-to-book; <1.0 = below book value
+    revenue_growth: Optional[float] = None   # YoY revenue growth; negative = declining
 
-    # Daily volatility (std of returns) — used for dynamic drawdown thresholds
-    volatility:     float         # e.g. 0.02 = 2% daily vol
-
-    # Relative performance vs market (stock_return - market_return)
-    excess_return:  float         # negative = underperforming market, positive = outperforming
-
-    # OBV Signal — from Layer 5 feature (volume_zscore * returns)
-    obv_signal:     float         # positive = buying pressure, negative = selling pressure
+    # Trend & regime context (loaded from detection layer)
+    price_vs_ma200: float = 0.0    # (close/ma200 - 1): positive = above MA200, negative = below
+    price_vs_ma50:  float = 0.0    # (close/ma50  - 1): positive = above MA50
+    regime:         str   = "unknown"  # bull / bear / sideways / transition_down / transition_up
+    volume_trend:   float = 1.0    # volume_ma5/volume_ma20: >1 = rising volume
+    trend_strength: float = 0.0    # trend strength score
 
 
 @dataclass
 class DecisionOutput:
-    """
-    Auditable decision output for one ticker/date.
-    Every field is traceable back to input signals.
-    """
     ticker:           str
     date:             str
-    severity:         str           # CRITICAL / WARNING / WATCH / NORMAL / POSITIVE_MOMENTUM / REVIEW
-    action:           str           # ESCALATE / MONITOR / OBSERVE / NONE / FLAG
-    confidence:       float         # anomaly_score / 4 — how confirmed is the signal (0-1)
-    context:          str           # "idiosyncratic" / "market_wide" / "sector_wide"
-    momentum_signal:  str           # "rising" / "falling" / "neutral"
-    caution_flag:     Optional[str] # e.g. "Dead Cat Bounce possible"
-    override_reason:  Optional[str] # set if a hard override was triggered
-    summary:          str           # plain English for non-technical managers
+    severity:         str
+    action:           str
+    confidence:       float
+    context:          str
+
+    # Signal summary (for narrator + portfolio page)
+    p_drawdown:             float = 0.0
+    anomaly_score:          int   = 0
+    anomaly_score_weighted: float = 0.0
+    drawdown_risk:          str   = "low"
+    momentum_signal:        str   = "neutral"
+    caution_flag:           bool  = False
+    override_reason:        str   = ""
+    summary:                str   = ""
+    sentiment_note:         str   = ""
+    trading_signal:         str   = "NEUTRAL"   # ENTRY / HOLD / EXIT / AVOID / NEUTRAL
 
 
-# ── Helper Functions ───────────────────
+# ── Core Logic ──────────────────────────────────────────────────────────────
 
-def _confidence(anomaly_score: int) -> float:
-    """
-    Convert anomaly_score (0-4) to confidence ratio (0-1).
-    Represents how many independent models confirmed the signal.
-    """
-    return round(anomaly_score / 4.0, 2)
-
-
-def _context(market_anomaly: bool, sector_anomaly: bool) -> str:
-    """
-    Classify whether the signal is stock-specific, sector-wide, or market-wide.
-    Used for report context — does NOT change severity.
-    """
-    if market_anomaly:
-        return "market_wide"
-    if sector_anomaly:
-        return "sector_wide"
-    return "idiosyncratic"
+def _dynamic_drawdown_threshold(volatility: float) -> tuple[float, float]:
+    """Tighter thresholds for calm stocks, capped for volatile ones."""
+    warning  = max(DRAWDOWN_WARNING_CAP,  -1.0 * volatility * 20)
+    critical = max(DRAWDOWN_CRITICAL_CAP, -2.0 * volatility * 20)
+    return warning, critical
 
 
-def _momentum_signal(rsi: float, momentum_5: float, momentum_10: float) -> str:
-    """
-    Classify momentum direction using RSI + momentum indicators.
-
-    falling : RSI overbought AND short-term momentum weaker than mid-term
-    rising  : both momentum values positive AND RSI not overbought
-              OR RSI oversold (potential recovery)
-    neutral : everything else
-    """
-    overbought  = rsi > RSI_OVERBOUGHT
-    oversold    = rsi < RSI_OVERSOLD
-    mom_falling = momentum_5 < momentum_10
-    mom_rising  = momentum_5 > 0 and momentum_10 > 0
-
-    if overbought and mom_falling:
-        return "falling"
-    if oversold:
-        return "rising"
-    if mom_rising and not overbought:
-        return "rising"
+def _momentum_label(mom5: float, mom10: float) -> str:
+    if mom5 > 0.02 and mom10 > 0.01:   return "positive"
+    if mom5 < -0.02 and mom10 < -0.01: return "negative"
+    if mom5 < -0.02 and mom10 > 0.01:  return "pullback"   # short dip in uptrend
+    if mom5 > 0.02 and mom10 < -0.01:  return "bounce"     # short pop in downtrend
     return "neutral"
 
 
-def _summary(
-    severity: str,
-    context: str,
-    caution_flag: Optional[str],
-    override_reason: Optional[str],
-    confidence: float
-) -> str:
+def _confidence(inp: AnomalyInput, severity: str) -> float:
     """
-    Generate plain English summary for non-technical managers.
-    No model jargon — business language only.
+    Confidence = historical precision (from walk-forward backtest) anchored per
+    severity level, then nudged ±10 pp by how strongly individual signals agree.
+
+    If the backtest file hasn't been generated yet, falls back to a pure
+    signal-agreement formula so the system still produces valid output.
     """
-    context_note = {
-        "market_wide":   "This movement is driven by broad market conditions, not the stock itself.",
-        "sector_wide":   "This movement is shared across the sector, not isolated to this stock.",
-        "idiosyncratic": "This signal is specific to this stock.",
-    }.get(context, "")
+    is_risk = severity in ("CRITICAL", "WARNING", "WATCH")
 
-    confidence_note = f"Signal confidence: {confidence:.0%}."
+    # ── Base: historical precision ────────────────────────────────────────────
+    if _HISTORICAL_PRECISION:
+        base = _HISTORICAL_PRECISION.get(severity, 0.35)
 
-    base = {
-        "CRITICAL":
-            "Multiple risk indicators have triggered simultaneously. "
-            "Immediate review is recommended.",
-        "WARNING":
-            "Elevated risk detected. Close monitoring is advised.",
-        "WATCH":
-            "A low-level signal has been detected. No immediate action needed, but worth observing.",
-        "NORMAL":
-            "No significant anomalies detected. Situation appears stable.",
-        "POSITIVE_MOMENTUM":
-            "Strong upward movement detected with controlled risk levels. "
-            "Positive momentum confirmed by trend indicators.",
-        "REVIEW":
-            "Risk indicators are elevated but anomaly signals are absent or contradictory. "
-            "Manual analyst review is recommended before any action.",
-    }.get(severity, "Status unclear.")
+        # ── Adjustment: how strongly do current signals agree? (−0.10 … +0.10)
+        agree = 0.0
+        if is_risk:
+            # p_drawdown above/below the warning threshold shifts confidence
+            agree += 0.05 * (inp.p_drawdown - P_DRAWDOWN_WARNING) / (1 - P_DRAWDOWN_WARNING)
+            agree += 0.03 * inp.anomaly_score_weighted
+            if inp.news_sentiment_score <= SENTIMENT_NEGATIVE:
+                agree += 0.02
+        else:
+            agree += 0.05 * (P_DRAWDOWN_LOW - inp.p_drawdown) / P_DRAWDOWN_LOW
+            agree += 0.03 * (1 - inp.anomaly_score_weighted)
+            if inp.news_sentiment_score >= SENTIMENT_POSITIVE:
+                agree += 0.02
 
-    parts = [base, context_note, confidence_note]
-    if caution_flag:
-        parts.append(f"Note: {caution_flag}.")
-    if override_reason:
-        parts.append(f"Trigger: {override_reason}.")
+        return round(min(max(base + agree, 0.10), 0.95), 2)
 
-    return " ".join(p for p in parts if p)
+    # ── Fallback: signal-agreement (used before backtest is run) ─────────────
+    signals = 0.0
+    total   = 9.0
+
+    # 1. Drawdown probability (weight 3)
+    if is_risk:
+        signals += 3 * inp.p_drawdown
+    else:
+        signals += 3 * (1 - inp.p_drawdown)
+
+    # 2. Weighted anomaly score (weight 3)
+    if is_risk:
+        signals += 3 * inp.anomaly_score_weighted
+    else:
+        signals += 3 * (1 - inp.anomaly_score_weighted)
+
+    # 3. Actual drawdown (weight 2)
+    dd_warn, _ = _dynamic_drawdown_threshold(inp.volatility)
+    if is_risk and inp.drawdown <= dd_warn:
+        signals += 2
+    elif not is_risk and inp.drawdown > dd_warn * 0.5:
+        signals += 2
+
+    # 4. News sentiment alignment (weight 1)
+    if is_risk and inp.news_sentiment_score <= SENTIMENT_NEGATIVE:
+        signals += 1
+    elif not is_risk and inp.news_sentiment_score >= SENTIMENT_POSITIVE:
+        signals += 1
+    else:
+        signals += 0.5
+
+    return round(signals / total, 2)
 
 
-# ── Core Decision Logic ─────────────────
+def _vix_thresholds(vix: float) -> tuple[float, float, float]:
+    """
+    VIX-regime-aware thresholds.
+    FP analysis showed: calm markets (VIX<20) generate the most false positives.
+    At low VIX, raise the bar — demand stronger evidence for WARNING/CRITICAL.
+
+    Returns: (p_warning, p_critical, p_watch)
+    """
+    if vix < 15:                              # very calm market
+        return 0.55, 0.68, 0.42
+    elif vix < 20:                            # normal market
+        return 0.50, 0.63, 0.40
+    elif vix < 25:                            # moderately elevated
+        return P_DRAWDOWN_WARNING,  P_DRAWDOWN_CRITICAL, 0.38
+    else:                                     # high fear — use base thresholds
+        return P_DRAWDOWN_WARNING,  P_DRAWDOWN_CRITICAL, 0.35
+
 
 def decide(inp: AnomalyInput) -> DecisionOutput:
     """
-    Main decision function.
-
-    Priority order:
-        1. Hard overrides      (drawdown — always fires regardless of other signals)
-        2. REVIEW              (score=0 + risk=high — models contradict each other)
-        3. ES Ratio Override   (tail risk too high, fires regardless of p_high confidence)
-        4. Core Matrix         (risk=high + p_high >= threshold — main severity driver)
-        5. Catch               (risk=high + p_high < threshold → WATCH, no silent fallthrough)
-        6. Low Risk cases      (POSITIVE_MOMENTUM / WATCH)
-        7. NORMAL              (default fallback)
-
-    Anomaly score is NEVER the severity driver.
-    It only affects the confidence value shown in the output.
+    Core decision logic — anomaly-first, no direction forecasting.
+    VIX-regime-aware thresholds + excess_return false-positive filter.
     """
-    confidence   = _confidence(inp.anomaly_score)
-    context      = _context(inp.market_anomaly, inp.sector_anomaly)
-    mom_signal   = _momentum_signal(inp.rsi, inp.momentum_5, inp.momentum_10)
-    caution      = None
-    override     = None
+    dd_warn, dd_crit         = _dynamic_drawdown_threshold(inp.volatility)
+    mom_label                = _momentum_label(inp.momentum_5, inp.momentum_10)
+    anomaly_w                = inp.anomaly_score_weighted
+    p_dd                     = inp.p_drawdown
+    caution                  = False
+    override_reason          = ""
 
-    # Dynamic drawdown thresholds — scale with stock's own volatility.
-    # For calm stocks (vol=0.01): warning=-1%, critical=-2% → tighter, unusual moves matter more.
-    # For volatile stocks (vol=0.05): warning=-5%, critical=-10% → wider, normal swings ignored.
-    # Caps prevent thresholds from becoming too loose on extreme movers (TSLA, NVDA).
-    # Uses 30-day vol approximation (daily vol * sqrt(21)) for comparison to 30D drawdown.
-    vol_30d          = inp.volatility * (21 ** 0.5)
-    drawdown_warning  = max(DRAWDOWN_WARNING_CAP,  -1.0 * vol_30d)
-    drawdown_critical = max(DRAWDOWN_CRITICAL_CAP, -2.0 * vol_30d)
+    # VIX-regime thresholds (key improvement from FP analysis)
+    p_warn, p_crit, p_watch  = _vix_thresholds(inp.vix_level)
 
-    # ── 1. Hard Override: Drawdown ────────────────────────────────────────────
-    if inp.drawdown <= drawdown_critical:
-        # Relative risk check: if stock is NOT significantly underperforming the market,
-        # the drawdown is market-driven — downgrade to WARNING (not idiosyncratic)
-        # Rule: market falls → WARNING; stock falls harder than market → CRITICAL
-        if inp.excess_return > EXCESS_RETURN_CRITICAL:
-            override = (
-                f"Drawdown {inp.drawdown:.1%} (threshold {drawdown_critical:.1%}) "
-                f"but in line with market (excess_return={inp.excess_return:+.1%})"
-            )
-            return DecisionOutput(
-                ticker=inp.ticker, date=inp.date,
-                severity="WARNING", action="MONITOR",
-                confidence=confidence, context=context,
-                momentum_signal=mom_signal,
-                caution_flag=None, override_reason=override,
-                summary=_summary("WARNING", context, None, override, confidence)
-            )
-        # Stock significantly underperforms market → CRITICAL (idiosyncratic risk)
-        override = (
-            f"Drawdown {inp.drawdown:.1%} (threshold {drawdown_critical:.1%}) "
-            f"AND underperforming market by {inp.excess_return:+.1%}"
-        )
-        return DecisionOutput(
-            ticker=inp.ticker, date=inp.date,
-            severity="CRITICAL", action="ESCALATE",
-            confidence=confidence, context=context,
-            momentum_signal=mom_signal,
-            caution_flag=None, override_reason=override,
-            summary=_summary("CRITICAL", context, None, override, confidence)
+    # ── Determine base severity ────────────────────────────────────────────
+
+    # CRITICAL: strong ML signal + strong anomaly
+    if p_dd >= p_crit and anomaly_w >= ANOMALY_MEDIUM:
+        severity = "CRITICAL"
+        action   = "ESCALATE"
+        context  = "high drawdown probability + anomaly confirmed"
+
+    # CRITICAL: extreme actual drawdown already happening
+    elif inp.drawdown <= dd_crit:
+        severity = "CRITICAL"
+        action   = "ESCALATE"
+        context  = "severe drawdown in progress"
+        override_reason = f"drawdown={inp.drawdown:.1%} ≤ {dd_crit:.1%}"
+
+    # WARNING: elevated ML signal OR medium anomaly
+    elif p_dd >= p_warn or anomaly_w >= ANOMALY_MEDIUM:
+        severity = "WARNING"
+        action   = "MONITOR"
+        context  = (
+            f"p_drawdown={p_dd:.0%}" if p_dd >= p_warn
+            else f"anomaly_weighted={anomaly_w:.2f}"
         )
 
-    if inp.drawdown <= drawdown_warning and inp.risk_level == "high":
-        override = f"Drawdown {inp.drawdown:.1%} (threshold {drawdown_warning:.1%}) with high risk"
-        return DecisionOutput(
-            ticker=inp.ticker, date=inp.date,
-            severity="WARNING", action="MONITOR",
-            confidence=confidence, context=context,
-            momentum_signal=mom_signal,
-            caution_flag=None, override_reason=override,
-            summary=_summary("WARNING", context, None, override, confidence)
+    # WARNING: meaningful actual drawdown
+    elif inp.drawdown <= dd_warn:
+        severity = "WARNING"
+        action   = "MONITOR"
+        context  = f"drawdown={inp.drawdown:.1%}"
+        override_reason = "actual drawdown threshold"
+
+    # WATCH: weak single signal
+    elif anomaly_w >= ANOMALY_WEAK or p_dd >= p_watch:
+        severity = "WATCH"
+        action   = "OBSERVE"
+        context  = "weak signal — monitor"
+
+    # POSITIVE: low drawdown risk + good technicals
+    elif (p_dd < P_DRAWDOWN_LOW
+          and inp.rsi < RSI_OVERBOUGHT
+          and mom_label in ("positive", "pullback")
+          and anomaly_w < ANOMALY_WEAK):
+        severity = "POSITIVE_SIGNAL"
+        action   = "NONE"
+        context  = f"low drawdown risk ({p_dd:.0%}) + {mom_label} momentum"
+
+    # NORMAL
+    else:
+        severity = "NORMAL"
+        action   = "NONE"
+        context  = "no significant signals"
+
+    # ── Caution flags (do not override severity, just flag) ────────────────
+
+    # RSI overbought + elevated drawdown risk
+    if inp.rsi >= RSI_OVERBOUGHT and p_dd >= 0.40:
+        caution = True
+        context += " | overbought RSI"
+
+    # Tail risk
+    if inp.es_ratio >= ES_RATIO_HIGH and severity not in ("CRITICAL",):
+        if severity == "NORMAL":
+            severity = "WATCH"
+            action   = "OBSERVE"
+        context += f" | tail risk (ES={inp.es_ratio:.1f})"
+
+    # Idiosyncratic vs market — if CRITICAL but market-wide, downgrade to WARNING
+    if severity == "CRITICAL" and inp.market_anomaly and inp.excess_return > -0.03:
+        severity = "WARNING"
+        action   = "MONITOR"
+        override_reason = "market-wide event, stock not underperforming"
+        context  = "broad market stress (not stock-specific)"
+
+    # Outperforming-stock false-positive filter (from backtest FP analysis):
+    # 61% of false positives came from stocks with positive excess_return.
+    # If the stock is outperforming the market AND drawdown signal isn't very strong,
+    # the risk signal is likely caused by the stock going UP unusually fast, not down.
+    if (severity == "WARNING"
+            and inp.excess_return > 0.02
+            and p_dd < p_crit
+            and anomaly_w < ANOMALY_STRONG):
+        severity = "WATCH"
+        action   = "OBSERVE"
+        override_reason = "stock outperforming market — reduced false positive risk"
+        context  += " | outperforming market (likely upward anomaly)"
+
+    # Negative news confirms risk signals
+    sentiment_note = ""
+    if inp.news_sentiment_score <= SENTIMENT_NEGATIVE:
+        if severity in ("WARNING", "WATCH"):
+            severity = "WARNING"
+            context += " | negative news confirms"
+        sentiment_note = f"bearish news ({inp.news_sentiment_score:+.2f})"
+    elif inp.news_sentiment_score >= SENTIMENT_POSITIVE:
+        if severity == "POSITIVE_SIGNAL":
+            context += " | positive news confirms"
+        sentiment_note = f"bullish news ({inp.news_sentiment_score:+.2f})"
+
+    # ── Fundamental signals ────────────────────────────────────────────────
+
+    # Earnings imminent (≤3 days) → always flag caution regardless of severity
+    if inp.days_to_next_earnings is not None and inp.days_to_next_earnings <= 3:
+        caution = True
+        context += f" | earnings in {inp.days_to_next_earnings}d"
+
+    # Heavy insider selling confirms risk signals
+    if inp.insider_sentiment <= -0.3:
+        if severity in ("WATCH", "WARNING"):
+            severity = "WARNING"
+            action   = "MONITOR"
+        context += f" | insider selling ({inp.insider_sentiment:+.2f})"
+
+    # Options market showing fear → confirm risk
+    if inp.options_fear and severity in ("WATCH", "WARNING", "CRITICAL"):
+        context += f" | options fear (P/C={inp.put_call_ratio:.2f})"
+
+    # REVIEW: conflicting signals (high anomaly but good fundamentals)
+    if (anomaly_w >= ANOMALY_MEDIUM
+            and p_dd < P_DRAWDOWN_WARNING
+            and inp.excess_return > 0.02
+            and severity not in ("CRITICAL",)):
+        severity = "REVIEW"
+        action   = "FLAG"
+        context  = "anomaly detected but drawdown model disagrees — manual check"
+
+    # ── Regime-aware adjustments ───────────────────────────────────────────────
+    # Bear market: elevate risk signals (more dangerous to hold in a downtrend)
+    if inp.regime == "bear":
+        if severity == "WATCH":
+            severity = "WARNING"
+            action   = "MONITOR"
+            context += " | bear market (elevated risk)"
+        elif severity in ("NORMAL", "POSITIVE_SIGNAL"):
+            caution = True
+            context += " | bear market regime"
+
+    # Transitioning down: add caution without changing severity
+    if inp.regime == "transition_down" and severity == "POSITIVE_SIGNAL":
+        caution = True
+        context += " | market transitioning down"
+
+    # Price well below MA200: structural downtrend — add context
+    if inp.price_vs_ma200 < -0.10 and severity in ("NORMAL", "POSITIVE_SIGNAL"):
+        caution = True
+        context += f" | below MA200 ({inp.price_vs_ma200:+.1%})"
+
+
+    # ── Valuation signals ─────────────────────────────────────────────────────
+    valuation_note = ""
+
+    # Negative P/E = company losing money → block ENTRY, add caution
+    if inp.pe_ratio is not None and inp.pe_ratio < 0:
+        valuation_note = "negative earnings"
+        if severity == "POSITIVE_SIGNAL":
+            severity = "NORMAL"
+            action   = "NONE"
+            context += " | negative earnings (no entry)"
+
+    # Highly overvalued (P/E > 50) → block ENTRY signal
+    elif inp.pe_ratio is not None and inp.pe_ratio > 50:
+        valuation_note = f"overvalued P/E={inp.pe_ratio:.0f}"
+        if severity == "POSITIVE_SIGNAL":
+            severity = "NORMAL"
+            action   = "NONE"
+            context += f" | overvalued (P/E={inp.pe_ratio:.0f}, no entry)"
+
+    # Cheap stock (P/E < 15 or P/B < 1.5) → strengthen POSITIVE_SIGNAL
+    elif ((inp.pe_ratio is not None and inp.pe_ratio < 15)
+          or (inp.pb_ratio is not None and inp.pb_ratio < 1.5)):
+        valuation_note = (
+            f"cheap P/E={inp.pe_ratio:.0f}" if inp.pe_ratio is not None and inp.pe_ratio < 15
+            else f"cheap P/B={inp.pb_ratio:.2f}"
         )
 
-    # ── 2. REVIEW: Conflicting signals ────────────────────────────────────────
-    # Risk model says high but no anomaly detected at all
-    if inp.anomaly_score == 0 and inp.risk_level == "high" and inp.p_high >= P_HIGH_THRESHOLD:
-        return DecisionOutput(
-            ticker=inp.ticker, date=inp.date,
-            severity="REVIEW", action="FLAG",
-            confidence=confidence, context=context,
-            momentum_signal=mom_signal,
-            caution_flag="Risk model and anomaly detection contradict each other",
-            override_reason=None,
-            summary=_summary("REVIEW", context,
-                             "Risk model and anomaly detection contradict each other",
-                             None, confidence)
-        )
+    # Declining revenue confirms risk signals
+    if inp.revenue_growth is not None and inp.revenue_growth < -0.05:
+        valuation_note += f" rev{inp.revenue_growth:+.0%}"
+        if severity in ("WATCH", "WARNING", "CRITICAL"):
+            context += f" | revenue declining ({inp.revenue_growth:+.0%})"
 
-    # ── 3. ES Ratio Override: Tail risk too high regardless of model confidence ─
-    # Fires even if p_high < P_HIGH_THRESHOLD — ES captures tail danger independently
-    if inp.risk_level == "high" and inp.es_ratio >= ES_RATIO_HIGH:
-        return DecisionOutput(
-            ticker=inp.ticker, date=inp.date,
-            severity="WARNING", action="MONITOR",
-            confidence=confidence, context=context,
-            momentum_signal=mom_signal,
-            caution_flag=f"Tail risk elevated: ES/VaR ratio = {inp.es_ratio:.2f}",
-            override_reason=None,
-            summary=_summary("WARNING", context,
-                             f"Tail risk elevated: ES/VaR ratio = {inp.es_ratio:.2f}",
-                             None, confidence)
-        )
+    # Forward P/E > trailing P/E means earnings expected to decline → caution on POSITIVE
+    if (inp.pe_forward is not None and inp.pe_ratio is not None
+            and inp.pe_forward > inp.pe_ratio * 1.2
+            and severity == "POSITIVE_SIGNAL"):
+        context += f" | earnings contraction expected (fwdPE={inp.pe_forward:.0f})"
 
-    # ── 4. Core Matrix: Risk x Direction ─────────────────────────────────────
+    # ── Trading Signal ────────────────────────────────────────────────────────
 
-    if inp.risk_level == "high" and inp.p_high >= P_HIGH_THRESHOLD:
+    # ── Overbought EXIT (profit-taking) — checked before severity gates
+    # RSI > 75: stock is strongly overextended, smart to take profits
+    # regardless of whether there's an active anomaly signal
+    overbought_exit = (
+        inp.rsi > 75
+        and inp.price_vs_ma200 > 0.15   # well above MA200 = extended run
+        and mom_label in ("positive", "bounce")  # still moving up = classic exit point
+    )
 
-        if inp.direction == "down" and inp.p_down >= P_DOWN_THRESHOLD:
-            # OBV sanity check: strong buying pressure despite downward signal → downgrade
-            if inp.obv_signal > 0.5:
-                caution = "Institutional buying detected despite downward signal"
-                return DecisionOutput(
-                    ticker=inp.ticker, date=inp.date,
-                    severity="WARNING", action="MONITOR",
-                    confidence=confidence, context=context,
-                    momentum_signal=mom_signal,
-                    caution_flag=caution, override_reason=None,
-                    summary=_summary("WARNING", context, caution, None, confidence)
-                )
-            # High risk + confirmed downward direction → CRITICAL
-            return DecisionOutput(
-                ticker=inp.ticker, date=inp.date,
-                severity="CRITICAL", action="ESCALATE",
-                confidence=confidence, context=context,
-                momentum_signal=mom_signal,
-                caution_flag=None, override_reason=None,
-                summary=_summary("CRITICAL", context, None, None, confidence)
-            )
+    if severity == "CRITICAL":
+        # CRITICAL = strong ML signal + anomaly → always EXIT
+        trading_signal = "EXIT"
+        exit_reason    = "risk"
 
-        if inp.direction == "down" and inp.p_down < P_DOWN_THRESHOLD:
-            # High risk but downward direction not confirmed → WARNING
-            return DecisionOutput(
-                ticker=inp.ticker, date=inp.date,
-                severity="WARNING", action="MONITOR",
-                confidence=confidence, context=context,
-                momentum_signal=mom_signal,
-                caution_flag="Downward direction signal is weak",
-                override_reason=None,
-                summary=_summary("WARNING", context,
-                                 "Downward direction signal is weak", None, confidence)
-            )
+    elif severity == "WARNING":
+        # WARNING → EXIT only with strong ML conviction AND no active recovery.
+        # Recovery check: if momentum_5 > 0.03 the stock is bouncing back — don't exit.
+        recovering = inp.momentum_5 > 0.03
 
-        if inp.direction == "stable":
-            # High risk + no clear direction → WARNING
-            return DecisionOutput(
-                ticker=inp.ticker, date=inp.date,
-                severity="WARNING", action="MONITOR",
-                confidence=confidence, context=context,
-                momentum_signal=mom_signal,
-                caution_flag=None, override_reason=None,
-                summary=_summary("WARNING", context, None, None, confidence)
-            )
+        strong_signal = p_dd >= 0.50 or anomaly_w >= 0.35
 
-        if inp.direction == "up":
-            # High risk + upward movement → ambiguous, flag Dead Cat Bounce
-            caution = "Elevated risk despite upward movement — possible Dead Cat Bounce"
-            return DecisionOutput(
-                ticker=inp.ticker, date=inp.date,
-                severity="WATCH", action="MONITOR",
-                confidence=confidence, context=context,
-                momentum_signal=mom_signal,
-                caution_flag=caution, override_reason=None,
-                summary=_summary("WATCH", context, caution, None, confidence)
-            )
+        if strong_signal and not recovering:
+            trading_signal = "EXIT"
+            exit_reason    = "risk"
+        elif strong_signal and recovering:
+            # Risk is elevated but stock is actively recovering → HOLD and watch
+            trading_signal = "HOLD"
+            exit_reason    = ""
+            context += " | recovering momentum — hold, monitor closely"
+        else:
+            # Past drawdown happened but ML disagrees it continues → HOLD
+            trading_signal = "HOLD"
+            exit_reason    = ""
 
-    # ── 5. Catch: risk=high but p_high below confidence threshold ────────────
-    # Prevents silent fallthrough to NORMAL when model is uncertain but risk=high
-    if inp.risk_level == "high" and inp.p_high < P_HIGH_THRESHOLD:
-        return DecisionOutput(
-            ticker=inp.ticker, date=inp.date,
-            severity="WATCH", action="OBSERVE",
-            confidence=confidence, context=context,
-            momentum_signal=mom_signal,
-            caution_flag="High risk signal with low model confidence",
-            override_reason=None,
-            summary=_summary("WATCH", context,
-                             "High risk signal with low model confidence",
-                             None, confidence)
-        )
+    elif overbought_exit and severity not in ("CRITICAL", "WARNING"):
+        # Profit-taking EXIT: stock ran too far, RSI overextended
+        trading_signal = "EXIT"
+        exit_reason    = "overbought"
+        context += f" | overbought RSI={inp.rsi:.0f}, +{inp.price_vs_ma200:.0%} above MA200 → take profits"
 
-    # ── 6. Low Risk cases ─────────────────────────────────────────────────────
+    elif severity == "WATCH":
+        trading_signal = "HOLD"
+        exit_reason    = ""
 
-    if inp.risk_level == "low":
+    elif severity == "POSITIVE_SIGNAL":
+        exit_reason = ""
+        # POSITIVE_SIGNAL already guarantees: p_dd < 30%, no anomaly, RSI < 70,
+        # positive or pullback momentum. We add 4 structural gates:
 
-        # POSITIVE_MOMENTUM: confirmed upside + rising momentum + stock-specific
-        if (
-            inp.direction == "up"
-            and inp.p_up >= P_DOWN_THRESHOLD
-            and mom_signal == "rising"
-            and inp.p_down < P_DOWN_LOW
-            and context == "idiosyncratic"
-        ):
-            return DecisionOutput(
-                ticker=inp.ticker, date=inp.date,
-                severity="POSITIVE_MOMENTUM", action="OBSERVE",
-                confidence=confidence, context=context,
-                momentum_signal=mom_signal,
-                caution_flag=None, override_reason=None,
-                summary=_summary("POSITIVE_MOMENTUM", context, None, None, confidence)
-            )
+        # Gate 1: Trend intact — not more than 10% below MA200
+        above_ma200  = inp.price_vs_ma200 > -0.10
 
-        if inp.direction == "down" and inp.p_down >= P_DOWN_THRESHOLD:
-            # Low risk + confirmed downward direction → WATCH
-            return DecisionOutput(
-                ticker=inp.ticker, date=inp.date,
-                severity="WATCH", action="OBSERVE",
-                confidence=confidence, context=context,
-                momentum_signal=mom_signal,
-                caution_flag=None, override_reason=None,
-                summary=_summary("WATCH", context, None, None, confidence)
-            )
+        # Gate 2: Market regime — bear or falling market = don't enter
+        regime_ok    = inp.regime not in ("bear", "transition_down")
 
-    # ── 7. NORMAL: Default fallback ───────────────────────────────────────────
+        # Gate 3: Valuation — no negative earnings, no extreme P/E
+        valuation_ok = inp.pe_ratio is None or (inp.pe_ratio > 0 and inp.pe_ratio < 60)
+
+        # Gate 4: Revenue — not collapsing
+        revenue_ok   = inp.revenue_growth is None or inp.revenue_growth >= -0.10
+
+        if above_ma200 and regime_ok and valuation_ok and revenue_ok:
+            trading_signal = "ENTRY"
+        else:
+            trading_signal = "HOLD"
+
+    elif severity == "NORMAL":
+        exit_reason    = ""
+        trading_signal = "NEUTRAL"
+
+    else:  # REVIEW
+        exit_reason    = ""
+        trading_signal = "NEUTRAL"
+
+    confidence = _confidence(inp, severity)
+
+    # Build human-readable summary
+    summary_parts = []
+    summary_parts.append(f"P(drawdown>5% / 20d) = {p_dd:.0%}")
+    summary_parts.append(f"Anomaly = {anomaly_w:.2f}")
+    summary_parts.append(f"RSI = {inp.rsi:.0f}")
+    if inp.drawdown < -0.03:
+        summary_parts.append(f"30d drawdown = {inp.drawdown:.1%}")
+    if sentiment_note:
+        summary_parts.append(sentiment_note)
+    if inp.insider_sentiment <= -0.3:
+        summary_parts.append(f"insiders selling ({inp.insider_sentiment:+.2f})")
+    if inp.days_to_next_earnings is not None and inp.days_to_next_earnings <= 7:
+        summary_parts.append(f"earnings in {inp.days_to_next_earnings}d")
+    if inp.options_fear:
+        summary_parts.append(f"options fear (P/C={inp.put_call_ratio:.2f})")
+    if valuation_note:
+        summary_parts.append(valuation_note)
+    summary = " | ".join(summary_parts)
+
     return DecisionOutput(
         ticker=inp.ticker, date=inp.date,
-        severity="NORMAL", action="NONE",
+        severity=severity, action=action,
         confidence=confidence, context=context,
-        momentum_signal=mom_signal,
-        caution_flag=None, override_reason=None,
-        summary=_summary("NORMAL", context, None, None, confidence)
+        p_drawdown=p_dd,
+        anomaly_score=inp.anomaly_score,
+        anomaly_score_weighted=anomaly_w,
+        drawdown_risk=inp.drawdown_risk,
+        momentum_signal=mom_label,
+        caution_flag=caution,
+        override_reason=override_reason,
+        summary=summary,
+        sentiment_note=sentiment_note,
+        trading_signal=trading_signal,
     )
 
 
-# ── Batch Processing ──────────────────────────────────────────────────────────
-
-def run_decision_engine(records: list[dict]) -> list[DecisionOutput]:
-    """
-    Process a list of ticker/date records through the decision engine.
-
-    Args:
-        records: list of dicts matching AnomalyInput fields
-
-    Returns:
-        list of DecisionOutput objects
-    """
+def run_decision_engine(records: list) -> list:
+    """Process list of dicts → list of DecisionOutput."""
     results = []
     for r in records:
-        inp = AnomalyInput(**r)
+        inp = AnomalyInput(**{
+            k: v for k, v in r.items()
+            if k in AnomalyInput.__dataclass_fields__
+        })
         results.append(decide(inp))
     return results
-
-
-# ── Example Usage ───────────────────────────────
-if __name__ == "__main__":
-    examples = [
-        {   # Expected: CRITICAL — drawdown override (-16% AND underperforms by 6%)
-            "ticker": "AAPL", "date": "2024-05-02",
-            "risk_level": "high", "p_high": 0.88,
-            "direction": "down", "p_down": 0.79, "p_up": 0.05,
-            "anomaly_score": 4, "market_anomaly": False, "sector_anomaly": False,
-            "es_ratio": 2.2, "rsi": 35.0,
-            "momentum_5": -0.03, "momentum_10": -0.01, "drawdown": -0.16,
-            "excess_return": -0.06,
-        },
-        {   # Expected: CRITICAL — risk=high + direction=down confirmed
-            "ticker": "MSFT", "date": "2024-05-02",
-            "risk_level": "high", "p_high": 0.72,
-            "direction": "down", "p_down": 0.68, "p_up": 0.10,
-            "anomaly_score": 2, "market_anomaly": False, "sector_anomaly": False,
-            "es_ratio": 1.6, "rsi": 42.0,
-            "momentum_5": -0.02, "momentum_10": 0.01, "drawdown": -0.02,
-        },
-        {   # Expected: WATCH + Dead Cat Bounce — risk=high + direction=up
-            "ticker": "TSLA", "date": "2024-05-02",
-            "risk_level": "high", "p_high": 0.75,
-            "direction": "up", "p_down": 0.15, "p_up": 0.65,
-            "anomaly_score": 3, "market_anomaly": False, "sector_anomaly": False,
-            "es_ratio": 1.7, "rsi": 55.0,
-            "momentum_5": 0.02, "momentum_10": 0.01, "drawdown": -0.01,
-        },
-        {   # Expected: POSITIVE_MOMENTUM — low risk + confirmed upside
-            "ticker": "NVDA", "date": "2024-05-02",
-            "risk_level": "low", "p_high": 0.28,
-            "direction": "up", "p_down": 0.08, "p_up": 0.75,
-            "anomaly_score": 3, "market_anomaly": False, "sector_anomaly": False,
-            "es_ratio": 0.9, "rsi": 62.0,
-            "momentum_5": 0.04, "momentum_10": 0.02, "drawdown": -0.005,
-        },
-        {   # Expected: REVIEW — score=0 but risk=high
-            "ticker": "JPM", "date": "2024-05-02",
-            "risk_level": "high", "p_high": 0.80,
-            "direction": "stable", "p_down": 0.30, "p_up": 0.25,
-            "anomaly_score": 0, "market_anomaly": False, "sector_anomaly": False,
-            "es_ratio": 1.7, "rsi": 50.0,
-            "momentum_5": 0.0, "momentum_10": 0.0, "drawdown": -0.01,
-        },
-        {   # Expected: NORMAL — low risk, stable
-            "ticker": "KO", "date": "2024-05-02",
-            "risk_level": "low", "p_high": 0.22,
-            "direction": "stable", "p_down": 0.20, "p_up": 0.30,
-            "anomaly_score": 0, "market_anomaly": False, "sector_anomaly": False,
-            "es_ratio": 0.8, "rsi": 48.0,
-            "momentum_5": 0.001, "momentum_10": 0.002, "drawdown": -0.003,
-        },
-    ]
-
-    decisions = run_decision_engine(examples)
-
-    for d in decisions:
-        print(f"\n{'='*65}")
-        print(f"  {d.ticker} | {d.date}")
-        print(f"  Severity   : {d.severity}")
-        print(f"  Action     : {d.action}")
-        print(f"  Confidence : {d.confidence:.0%}")
-        print(f"  Context    : {d.context}")
-        print(f"  Momentum   : {d.momentum_signal}")
-        if d.caution_flag:
-            print(f"  Caution    : {d.caution_flag}")
-        if d.override_reason:
-            print(f"  Override   : {d.override_reason}")
-        print(f"  Summary    : {d.summary}")

@@ -34,7 +34,7 @@ def load_etf_data():
 # Add market context to each stock: is the anomaly market-wide or stock-specific?
 def compare(df, spx, etf_data, ticker):
     sector = next(a["sector"] for a in assets if a["ticker"] == ticker)
-    etf_name = sector_etfs[sector]
+    etf_name = sector_etfs.get(sector, "XLK")  # XLK fallback if a new sector is added without ETF mapping
     etf_df = etf_data[etf_name]
     df = df.set_index("Date")
     if "spx_return" in df.columns:

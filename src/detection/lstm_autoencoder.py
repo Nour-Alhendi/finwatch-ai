@@ -25,18 +25,22 @@ SMOOTH_WINDOW   = 5
 N_FEATURES      = len(LSTM_AE_FEATURES)
 
 GROUPS = {
-    "Technology-Stable":   {"tickers": ["AAPL", "MSFT", "GOOG"],             "calm_q": 0.65, "percentile": 3},
-    "Technology-Volatile": {"tickers": ["NVDA", "AMD"],                       "calm_q": 0.65, "percentile": 3},
-    "AI-Stable":           {"tickers": ["CRM", "SNOW"],                       "calm_q": 0.65, "percentile": 5},
-    "AI-Volatile":         {"tickers": ["PLTR", "META", "AI"],                "calm_q": 0.75, "percentile": 3},
-    "Consumer-Stable":     {"tickers": ["NKE", "MCD", "SBUX"],                "calm_q": 0.65, "percentile": 5},
-    "Consumer-Volatile":   {"tickers": ["TSLA", "AMZN"],                      "calm_q": 0.70, "percentile": 3},
-    "Financials":          {"tickers": ["JPM", "BAC", "GS", "MS", "BLK"],     "calm_q": 0.70, "percentile": 4},
-    "Healthcare":          {"tickers": ["JNJ", "PFE", "UNH", "ABBV", "MRK"],  "calm_q": 0.75, "percentile": 3},
-    "Consumer Staples":    {"tickers": ["PG", "KO", "COST", "WMT", "CL"],     "calm_q": 0.70, "percentile": 3},
-    "Energy":              {"tickers": ["XOM", "CVX", "COP", "SLB", "EOG"],   "calm_q": 0.70, "percentile": 3},
-    "Industrials":         {"tickers": ["CAT", "HON", "BA", "GE", "RTX"],     "calm_q": 0.75, "percentile": 3},
-    "Green Energy":        {"tickers": ["BE", "ENPH", "PLUG", "NEE", "FSLR"], "calm_q": 0.75, "percentile": 3},
+    "Technology-Stable":   {"tickers": ["AAPL", "MSFT", "GOOG", "INTC"],      "calm_q": 0.65, "percentile": 3},
+    "Technology-Volatile": {"tickers": ["NVDA", "AMD"],                                "calm_q": 0.60, "percentile": 4},
+    "Semiconductors":      {"tickers": ["AVGO", "QCOM", "MU"],                        "calm_q": 0.65, "percentile": 3},
+    "AI-Stable":           {"tickers": ["CRM", "SNOW"],                               "calm_q": 0.65, "percentile": 5},
+    "AI-Volatile":         {"tickers": ["PLTR", "META"],                              "calm_q": 0.65, "percentile": 4},
+    "Cybersecurity":       {"tickers": ["PANW", "CRWD", "NET"],                       "calm_q": 0.65, "percentile": 4},
+    "Consumer-Stable":     {"tickers": ["NKE", "MCD", "SBUX"],                        "calm_q": 0.65, "percentile": 5},
+    "Consumer-Volatile":   {"tickers": ["TSLA", "AMZN"],                              "calm_q": 0.70, "percentile": 3},
+    "Financials":          {"tickers": ["JPM", "BAC", "GS", "MS", "BLK", "V", "MA"], "calm_q": 0.70, "percentile": 4},
+    "Healthcare":          {"tickers": ["JNJ", "PFE", "UNH", "ABBV", "MRK", "LLY", "AMGN"], "calm_q": 0.75, "percentile": 3},
+    "Consumer Staples":    {"tickers": ["PG", "KO", "COST", "WMT", "CL"],             "calm_q": 0.70, "percentile": 3},
+    "Energy":              {"tickers": ["XOM", "CVX", "COP", "SLB", "EOG"],           "calm_q": 0.70, "percentile": 3},
+    "Industrials":         {"tickers": ["CAT", "HON", "BA", "GE", "RTX"],             "calm_q": 0.70, "percentile": 3},
+    "Green Energy":        {"tickers": ["ENPH", "NEE", "FSLR"],                       "calm_q": 0.75, "percentile": 3},
+    "Crypto-Volatile":     {"tickers": ["BITF", "IREN", "MARA", "RIOT", "COIN"],      "calm_q": 0.60, "percentile": 5},
+    "SmallCap-Volatile":   {"tickers": ["BE", "PLUG", "RCAT", "KRKNF", "QNC", "RZLV", "NBIS", "AI"], "calm_q": 0.55, "percentile": 5},
 }
 
 
@@ -82,6 +86,9 @@ def run_autoencoder():
                 continue
             df = pd.read_parquet(file)
             df = df.dropna(subset=LSTM_AE_FEATURES).reset_index(drop=True)
+            if df.empty:
+                print(f"  Skipping {ticker}: no rows after dropna (missing features)")
+                continue
             df["_is_train"] = df["Date"] < split_date
             df["_ticker"] = ticker
             frames.append(df)

@@ -6,6 +6,11 @@ HTML analysis panels, anomaly explanations, and investor summaries.
 from analytics.signals import calculate_risk_drivers
 
 
+def _tip(term: str, defn: str) -> str:
+    """Wrap a financial term in a CSS tooltip span."""
+    return f'<span class="tip" data-tip="{defn}">{term}</span>'
+
+
 def build_analysis(det_df, dec_row, ticker, name, lang="english"):
     if det_df is None or det_df.empty:
         return None
@@ -213,23 +218,6 @@ def build_analysis(det_df, dec_row, ticker, name, lang="english"):
     if caution:
         fcast_html += r_row(warn("⚠"), caution)
 
-    # ── Risk drivers ──────────────────────────────────────────────────────────
-    drivers = calculate_risk_drivers(r.to_dict() if hasattr(r, "to_dict") else r,
-                                     row.to_dict() if hasattr(row, "to_dict") else row)
-    drivers_html = None
-    if drivers and sev in ("CRITICAL", "WARNING", "WATCH"):
-        _level_ic  = {"high": risk("●"), "medium": warn("▲"), "low": neu("→")}
-        driver_rows = "".join(
-            r_row(_level_ic.get(lvl, neu()), txt)
-            for lvl, txt in drivers[:6]
-        )
-        drivers_html = (
-            '<div class="analysis-panel" style="margin-top:0;border-top:none;padding-top:0">'
-            '<div class="an-title" style="margin-bottom:6px">Why is risk elevated?</div>'
-            + driver_rows
-            + "</div>"
-        )
-
     main_html = (
         '<div class="analysis-panel">'
         f'<div class="an-header">Market Analysis \u2014 {name} ({ticker})'
@@ -241,10 +229,10 @@ def build_analysis(det_df, dec_row, ticker, name, lang="english"):
         f'<div class="an-section"><div class="an-title">AI Forecast (5D)</div>{fcast_html}</div>'
         "</div></div>"
     )
-    return main_html, drivers_html
+    return main_html, None
 
 
-def explain_anomaly(r, ticker_name, date_str):
+def explain_anomaly(r, ticker_name, date_str, dec_row=None):
     detectors = []
     if r.get("z_anomaly",  False): detectors.append(f"Z-Score (30d): Return deviated strongly from 30-day norm (z = {r.get('z_score', 0):.2f})")
     if r.get("z_anomaly_60",False): detectors.append(f"Z-Score (60d): Deviation confirmed over 60-day window (z = {r.get('z_score_60', 0):.2f})")
@@ -258,28 +246,89 @@ def explain_anomaly(r, ticker_name, date_str):
     vol = r.get("volatility", None)
     if vol is not None: ctx.append(f"Volatility: {vol*100:.2f}%")
     rsi = r.get("rsi", None)
-    if rsi is not None: ctx.append(f"RSI: {rsi:.1f}")
+    if rsi is not None: ctx.append(f'{_tip("RSI", "Relative Strength Index — momentum indicator. Above 70: overbought. Below 30: oversold.")}: {rsi:.1f}')
     vz = r.get("volume_zscore", None)
-    if vz is not None and abs(vz) > 1.5: ctx.append(f"Volume spike (z = {vz:.1f})")
+    if vz is not None and abs(vz) > 1.5: ctx.append(f'Volume spike ({_tip("z", "Z-Score — how many standard deviations from the historical average.")} = {vz:.1f})')
     if r.get("market_anomaly", False): ctx.append("Market-wide event")
     if r.get("sector_anomaly", False): ctx.append("Sector-wide event")
     if r.get("is_high_volume", False): ctx.append("Unusually high volume")
-    score   = int(r.get("anomaly_score", len(detectors)))
+    score    = int(r.get("anomaly_score", len(detectors)))
     det_html = "<br>".join(detectors)
+
+    def _pill(label: str, color: str) -> str:
+        return (
+            f'<span style="display:inline-block;background:rgba(30,45,65,0.6);'
+            f'border:1px solid {color}33;border-radius:4px;padding:2px 8px;'
+            f'margin:3px 4px 3px 0;font-size:12px;color:{color};'
+            f'font-family:\'IBM Plex Mono\',monospace;white-space:nowrap">{label}</span>'
+        )
+
+    pills = []
+    ret = r.get("returns", None)
+    if ret is not None:
+        c = "#1de9b6" if ret >= 0 else "#f85149"
+        pills.append(_pill(f"Return: {ret*100:+.2f}%", c))
+    vol = r.get("volatility", None)
+    if vol is not None:
+        c = "#f85149" if vol > 0.03 else "#e3b341" if vol > 0.015 else "#b8c4ce"
+        vol_tip = _tip("Volatility", "Average daily price swing. Above 3%: high risk. Above 1.5%: elevated.")
+        pills.append(_pill(f"{vol_tip}: {vol*100:.2f}%", c))
+    rsi = r.get("rsi", None)
+    if rsi is not None:
+        c = "#f85149" if rsi > 70 else "#1de9b6" if rsi < 30 else "#b8c4ce"
+        pills.append(_pill(f'{_tip("RSI", "Relative Strength Index. Above 70: overbought. Below 30: oversold.")}: {rsi:.1f}', c))
+    vz = r.get("volume_zscore", None)
+    if vz is not None and abs(vz) > 1.5:
+        pills.append(_pill(f'Volume spike (z={vz:.1f})', "#e3b341"))
+    if r.get("market_anomaly", False):
+        pills.append(_pill("Market-wide event", "#a371f7"))
+    if r.get("sector_anomaly", False):
+        pills.append(_pill("Sector-wide event", "#58a6ff"))
+    if r.get("is_high_volume", False):
+        pills.append(_pill("High volume", "#e3b341"))
+
     ctx_html = (
-        "<div style=\"font-size:9px;color:#5c7080;margin-top:8px;"
-        "font-family:'IBM Plex Mono',monospace\">" + " · ".join(ctx) + "</div>"
-    ) if ctx else ""
+        f'<div style="margin-top:10px;padding-top:8px;'
+        f'border-top:1px solid #1a2332">{"".join(pills)}</div>'
+    ) if pills else ""
+
+    # ── Why is Risk Elevated? ─────────────────────────────────────────────────
+    drivers_html = ""
+    if dec_row is not None:
+        dec_dict = dec_row.to_dict() if hasattr(dec_row, "to_dict") else dict(dec_row)
+        r_dict   = r.to_dict()       if hasattr(r,       "to_dict") else dict(r)
+        sev      = str(dec_dict.get("severity", "NORMAL"))
+        if sev in ("CRITICAL", "WARNING", "WATCH"):
+            drivers = calculate_risk_drivers(r_dict, dec_dict)
+            if drivers:
+                _lvl_color = {"high": "#f85149", "medium": "#e3b341", "low": "#8b949e"}
+                _lvl_icon  = {"high": "●", "medium": "▲", "low": "→"}
+                driver_rows = "".join(
+                    f'<div style="display:flex;align-items:flex-start;gap:6px;padding:3px 0">'
+                    f'<span style="color:{_lvl_color.get(lvl,"#8b949e")};font-size:11px;flex-shrink:0">{_lvl_icon.get(lvl,"→")}</span>'
+                    f'<span style="font-size:12px;color:#b8c4ce;font-family:\'IBM Plex Mono\',monospace;line-height:1.6">{txt}</span>'
+                    f'</div>'
+                    for lvl, txt in drivers[:6]
+                )
+                drivers_html = (
+                    f'<div style="margin-top:12px;padding-top:10px;border-top:1px solid #1a2332">'
+                    f'<div style="font-size:10px;letter-spacing:1.5px;text-transform:uppercase;'
+                    f'color:#3d5266;font-family:\'IBM Plex Mono\',monospace;margin-bottom:8px">'
+                    f'Why is Risk Elevated?</div>'
+                    f'{driver_rows}</div>'
+                )
+
     return (
         "<div style=\"background:#0d1117;border:1px solid #1a2332;border-radius:3px;"
-        "padding:10px 14px;margin-top:4px\">"
-        "<div style=\"font-size:10px;color:#cdd9e5;font-family:'IBM Plex Mono',monospace;"
+        "padding:12px 16px;margin-top:4px\">"
+        "<div style=\"font-size:12px;color:#cdd9e5;font-family:'IBM Plex Mono',monospace;"
         f"margin-bottom:4px\">{ticker_name} — {date_str}</div>"
-        "<div style=\"font-size:9px;color:#5c7080;font-family:'IBM Plex Mono',monospace;"
-        f"margin-bottom:8px\">{score} of 4 detectors triggered</div>"
-        "<div style=\"font-size:10px;color:#8b949e;line-height:1.8;"
+        "<div style=\"font-size:11px;color:#5c7080;font-family:'IBM Plex Mono',monospace;"
+        f"margin-bottom:10px\">{score} of 4 detectors triggered</div>"
+        "<div style=\"font-size:12px;color:#8b949e;line-height:1.9;"
         f"font-family:'IBM Plex Mono',monospace\">{det_html}</div>"
         f"{ctx_html}"
+        f"{drivers_html}"
         "</div>"
     )
 
@@ -293,13 +342,13 @@ def build_investor_summary(det_df, dec_row, row, news_df, ticker) -> str:
     sev    = str(row.get("severity", "NORMAL"))
     action = str(row.get("action", "MONITOR"))
     conf   = float(row.get("confidence", 0))
-    sev_color = {"CRITICAL":"#e05252","WARNING":"#e0a030","NORMAL":"#52b788"}.get(sev, "#adb5bd")
+    sev_color = {"CRITICAL":"#e05252","WARNING":"#e0a030","NORMAL":"#52b788"}.get(sev, "#b8c4ce")
     signals.append(
         f'<span style="color:{sev_color};font-weight:600">{sev}</span>'
-        f'<span style="color:#5c7080"> — Action: </span>'
-        f'<span style="color:#adb5bd">{action}</span>'
-        f'<span style="color:#5c7080"> · Confidence: </span>'
-        f'<span style="color:#adb5bd">{int(conf*100)}%</span>'
+        f'<span style="color:#7a8fa8"> — Action: </span>'
+        f'<span style="color:#b8c4ce">{action}</span>'
+        f'<span style="color:#7a8fa8"> · {_tip("Confidence", "Model precision on similar signals in historical backtests.")}: </span>'
+        f'<span style="color:#b8c4ce">{int(conf*100)}%</span>'
     )
 
     # ── Risk drivers — "why is risk elevated?" ─────────────────────────────
@@ -316,9 +365,9 @@ def build_investor_summary(det_df, dec_row, row, news_df, ticker) -> str:
                 for lvl, txt in drivers[:5]
             ]
             signals.append(
-                f'<span style="color:#5c7080;font-size:10px">Risk driven by:</span><br>'
+                f'<span style="color:#7a8fa8;font-size:12px">Risk driven by:</span><br>'
                 + "<br>".join(
-                    f'<span style="color:#adb5bd;padding-left:10px">{d}</span>'
+                    f'<span style="color:#b8c4ce;padding-left:10px">{d}</span>'
                     for d in driver_parts
                 )
             )
@@ -328,15 +377,22 @@ def build_investor_summary(det_df, dec_row, row, news_df, ticker) -> str:
     if last.get("z_anomaly_60"): detectors.append("Z-Score (60D)")
     if last.get("if_anomaly"):   detectors.append("Isolation Forest")
     if last.get("ae_anomaly"):   detectors.append("LSTM Autoencoder")
+    _det_tips = {
+        "Z-Score (30D)":      _tip("Z-Score (30D)",      "How unusual the return is vs. its 30-day history."),
+        "Z-Score (60D)":      _tip("Z-Score (60D)",      "How unusual the return is vs. its 60-day history."),
+        "Isolation Forest":   _tip("Isolation Forest",   "ML model detecting multivariate outliers in price & volume."),
+        "LSTM Autoencoder":   _tip("LSTM Autoencoder",   "Deep learning model that flags unusual price sequences."),
+    }
+    det_labels = [_det_tips.get(d, d) for d in detectors]
     if detectors:
         signals.append(
             f'<span style="color:#e05252">⬤</span>'
-            f'<span style="color:#adb5bd"> Anomaly detected [{", ".join(detectors)}] — unusual price or volume pattern identified</span>'
+            f'<span style="color:#b8c4ce"> {_tip("Anomaly", "AI flagged unusual price or volume behavior.")} detected [{", ".join(det_labels)}]</span>'
         )
     else:
         signals.append(
             f'<span style="color:#52b788">▲</span>'
-            f'<span style="color:#adb5bd"> No anomalies detected — behavior within normal range</span>'
+            f'<span style="color:#b8c4ce"> No {_tip("anomalies", "AI found no unusual price or volume patterns — behavior is within normal range.")} detected</span>'
         )
 
     direction, p_down = "stable", 0.33
@@ -349,8 +405,9 @@ def build_investor_summary(det_df, dec_row, row, news_df, ticker) -> str:
     dir_color = {"up":"#1de9b6","down":"#e05252","stable":"#adb5bd"}.get(direction, "#adb5bd")
     signals.append(
         f'<span style="color:{dir_color}">{dir_icon}</span>'
-        f'<span style="color:#adb5bd"> AI 5-day forecast: <strong style="color:{dir_color}">{direction.upper()}</strong>'
-        f' — P(up) {int(p_up*100)}% · P(down) {int(p_down*100)}%</span>'
+        f'<span style="color:#b8c4ce"> AI 5-day forecast: <strong style="color:{dir_color}">{direction.upper()}</strong>'
+        f' — {_tip("P(up)", "AI probability estimate for a price rise in the next 5 days.")} {int(p_up*100)}%'
+        f' · {_tip("P(down)", "AI probability estimate for a price drop in the next 5 days.")} {int(p_down*100)}%</span>'
     )
 
     mom = "neutral"
@@ -362,7 +419,7 @@ def build_investor_summary(det_df, dec_row, row, news_df, ticker) -> str:
     mom_color = {"rising":"#1de9b6","falling":"#e05252","neutral":"#adb5bd"}.get(mom, "#adb5bd")
     signals.append(
         f'<span style="color:{mom_color}">{mom_icon}</span>'
-        f'<span style="color:#adb5bd"> Momentum: <strong style="color:{mom_color}">{mom.capitalize()}</strong></span>'
+        f'<span style="color:#b8c4ce"> {_tip("Momentum", "Speed and direction of recent price change. Rising = accelerating upward.")}: <strong style="color:{mom_color}">{mom.capitalize()}</strong></span>'
     )
 
     if news_df is not None and ticker in news_df["ticker"].values:
@@ -377,20 +434,20 @@ def build_investor_summary(det_df, dec_row, row, news_df, ticker) -> str:
             sent_color = {"positive":"#52b788","negative":"#e05252","neutral":"#adb5bd"}.get(dominant, "#adb5bd")
             signals.append(
                 f'<span style="color:{sent_color}">{sent_icon}</span>'
-                f'<span style="color:#adb5bd"> News sentiment: <strong style="color:{sent_color}">{dominant.capitalize()}</strong></span>'
+                f'<span style="color:#b8c4ce"> News sentiment: <strong style="color:{sent_color}">{dominant.capitalize()}</strong></span>'
             )
 
     rows_html = "".join(
         f'<div style="padding:4px 0;border-bottom:1px solid #1a2332;font-size:11px;'
-        f'font-family:\'IBM Plex Sans\',sans-serif;line-height:1.5">{s}</div>'
+        f'font-family:\'IBM Plex Sans\',sans-serif;line-height:1.6">{s}</div>'
         for s in signals
     )
     return f"""
     <div style="background:#0d1117;border:1px solid #1a2332;border-radius:3px;
-                padding:12px 18px;margin-top:8px;margin-bottom:4px">
-      <div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;
+                padding:14px 20px;margin-top:8px;margin-bottom:4px">
+      <div style="font-size:10px;letter-spacing:2px;text-transform:uppercase;
                   color:#5c7080;font-family:'IBM Plex Mono',monospace;
-                  border-bottom:1px solid #1a2332;padding-bottom:7px;margin-bottom:8px">
+                  border-bottom:1px solid #1a2332;padding-bottom:8px;margin-bottom:10px">
         Investor Summary
       </div>
       {rows_html}

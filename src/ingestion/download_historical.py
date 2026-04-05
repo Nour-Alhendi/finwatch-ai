@@ -1,66 +1,53 @@
 import pandas as pd
 import yaml
+import yfinance as yf
 from pathlib import Path
-from pandas_datareader import data as web
 from datetime import datetime, timedelta
 
-# Load asset configuration
-with open("config/assets.yaml", "r") as f:
-    config = yaml.safe_load(f)
+ROOT = Path(__file__).resolve().parents[2]
 
-assets = config["assets"]
-references = config["references"]
 
-end_date = datetime.today()
-start_date = end_date - timedelta(days=365 * 10)
+def run():
+    with open(ROOT / "config/assets.yaml", "r") as f:
+        config = yaml.safe_load(f)
 
-output_dir = Path("data/raw/raw_clean")
-output_dir.mkdir(parents=True, exist_ok=True)
+    assets     = config["assets"]
+    references = config["references"]
 
-ref_dir = Path("data/raw/references")
-ref_dir.mkdir(parents=True, exist_ok=True)
+    end_date   = datetime.today()
+    start_date = end_date - timedelta(days=365 * 10)
 
-for asset in references:
-    ticker = asset["ticker"]
-    ticker_stooq = ticker.lower()
-    print(f"Downloading reference {ticker} from Stooq...")
-    try:
-        df = web.DataReader(ticker_stooq, "stooq", start_date, end_date)
-    except Exception as e:
-        print(f"Failed {ticker}: {e}")
-        continue
-    if df.empty:
-        print(f"No data for {ticker}")
-        continue
-    df = df.sort_index()
-    df.reset_index(inplace=True)
-    df.to_parquet(ref_dir / f"{ticker}.parquet")
-    print(f"Saved {ticker}")
+    output_dir = ROOT / "data/raw/raw_clean"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-for asset in assets:
-    ticker = asset["ticker"]
+    ref_dir = ROOT / "data/raw/references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
 
-    # Stooq uses lowercase tickers
-    ticker_stooq = ticker.lower()
+    def _download(ticker: str, out_dir: Path):
+        print(f"Downloading {ticker}...", end=" ")
+        try:
+            df = yf.download(ticker, start=start_date, end=end_date,
+                             auto_adjust=True, progress=False)
+            if df.empty:
+                print("no data")
+                return
+            df = df.reset_index()
+            # yfinance MultiIndex columns → flatten
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [col[0] if col[1] == "" else col[0] for col in df.columns]
+            df.to_parquet(out_dir / f"{ticker}.parquet")
+            print(f"saved ({len(df)} rows, latest: {df['Date'].max().date()})")
+        except Exception as e:
+            print(f"failed: {e}")
 
-    print(f"Downloading {ticker} from Stooq...")
+    for asset in references:
+        _download(asset["ticker"], ref_dir)
 
-    try:
-        df = web.DataReader(ticker_stooq, "stooq", start_date, end_date)
-    except Exception as e:
-        print(f"Failed {ticker}: {e}")
-        continue
+    for asset in assets:
+        _download(asset["ticker"], output_dir)
 
-    if df.empty:
-        print(f"No data for {ticker}")
-        continue
+    print("Download finished.")
 
-    df = df.sort_index()
-    df.reset_index(inplace=True)
 
-    file_path = output_dir / f"{ticker}.parquet"
-    df.to_parquet(file_path)
-
-    print(f"Saved {ticker}")
-
-print("Download finished.")
+if __name__ == "__main__":
+    run()

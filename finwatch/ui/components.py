@@ -13,7 +13,7 @@ import streamlit as st
 import pandas as pd
 
 from data.loader import (
-    COMPANY_NAMES, SECTORS, SEV_CLS,
+    COMPANY_NAMES, SECTORS, SEV_CLS, load_anomaly_precision,
 )
 from analytics.analysis import (
     build_analysis, build_investor_summary, explain_anomaly,
@@ -27,13 +27,63 @@ def _safe_list(val):
     except: return []
 
 
+def _tip(term: str, defn: str) -> str:
+    """Wrap a financial term in a CSS tooltip span."""
+    return f'<span class="tip" data-tip="{defn}">{term}</span>'
+
+
 # ── Language analysis modal ───────────────────────────────────────────────────
 
+def _build_chart_b64(det_df, ticker: str) -> str:
+    """Generate a 90-day price + EMA20 chart and return as base64 PNG string."""
+    import io, base64
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mticker
+    import numpy as np
+
+    df = det_df.copy().tail(90)
+    dates  = df["Date"].values
+    closes = df["Close"].values
+    ema20  = df["ema_20"].values if "ema_20" in df.columns else None
+
+    fig, ax = plt.subplots(figsize=(10, 3.2))
+    fig.patch.set_facecolor("#060a0f")
+    ax.set_facecolor("#060a0f")
+
+    # Price area fill
+    ax.fill_between(dates, closes, alpha=0.08, color="#1de9b6")
+    ax.plot(dates, closes, color="#1de9b6", linewidth=1.6, zorder=3)
+    if ema20 is not None:
+        ax.plot(dates, ema20, color="#58a6ff", linewidth=1.0, linestyle="--", alpha=0.7, zorder=2)
+
+    # Styling
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#1a2332")
+    ax.tick_params(colors="#3d5266", labelsize=7)
+    ax.xaxis.set_major_locator(mticker.MaxNLocator(6))
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.0f"))
+    ax.set_xlim(dates[0], dates[-1])
+    ax.grid(axis="y", color="#1a2332", linewidth=0.5, alpha=0.6)
+    ax.grid(axis="x", visible=False)
+    fig.autofmt_xdate(rotation=0, ha="center")
+    plt.tight_layout(pad=0.4)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+
 @st.dialog("AI Analyst Report", width="large")
-def show_analysis_modal(ticker: str, news_df, lang: str) -> None:
-    """Show the AI Analyst Report in a large modal in the selected language."""
+def show_analysis_modal(ticker: str, name: str, det_df, news_df, lang: str) -> None:
+    """Show the AI Analyst Report in a large modal with chart and PDF download."""
     st.session_state.lang_modal = None   # reset so closing X doesn't reopen
     from llm.translator import translate
+    lang_labels = {"english": "English", "german": "Deutsch", "arabic": "العربية"}
+
     if news_df is None or ticker not in news_df["ticker"].values:
         st.markdown(
             '<div style="font-size:11px;color:#5c7080;font-family:IBM Plex Mono">'
@@ -49,21 +99,115 @@ def show_analysis_modal(ticker: str, news_df, lang: str) -> None:
             unsafe_allow_html=True,
         )
         return
-    lang_labels = {"english": "English", "german": "Deutsch", "arabic": "العربية"}
+
+    with st.spinner("Loading…"):
+        display_text = translate(llm_text, lang, ticker) if lang != "english" else llm_text
+
+    # ── Build chart base64 ────────────────────────────────────────────────────
+    chart_b64   = ""
+    chart_tag   = ""
+    if det_df is not None and "Close" in det_df.columns and len(det_df) > 5:
+        try:
+            chart_b64 = _build_chart_b64(det_df, ticker)
+            chart_tag = f'<img src="data:image/png;base64,{chart_b64}" style="width:100%;border-radius:6px;margin:20px 0 10px" />'
+        except Exception:
+            pass
+
+    # ── Build HTML for download ───────────────────────────────────────────────
+    rtl_css   = "direction:rtl;text-align:right;" if lang == "arabic" else ""
+    safe_body = display_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+    html_content = f"""<!DOCTYPE html>
+<html lang="{lang[:2]}">
+<head>
+<meta charset="UTF-8">
+<title>FinWatch AI — {name} ({ticker})</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&family=IBM+Plex+Sans:wght@400;600&display=swap');
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  html{{background:#060a0f}}
+  body{{
+    font-family:'IBM Plex Sans',sans-serif;
+    max-width:820px;margin:0 auto;padding:48px 36px 64px;
+    background:#060a0f;color:#adb5bd;
+    line-height:1.9;font-size:13px;
+    {rtl_css}
+  }}
+  .fw-logo{{
+    font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:700;
+    background:linear-gradient(135deg,#e2e8f0 0%,#1de9b6 40%,#58a6ff 75%,#a371f7 100%);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+    background-clip:text;letter-spacing:0.5px;margin-bottom:32px;
+    display:inline-block;
+  }}
+  .badge{{
+    display:inline-block;font-family:'IBM Plex Mono',monospace;font-size:9px;
+    letter-spacing:3px;text-transform:uppercase;color:#1de9b6;
+    border:1px solid rgba(29,233,182,0.3);border-radius:3px;
+    padding:3px 10px;margin-bottom:20px;
+  }}
+  h1{{
+    font-family:'IBM Plex Mono',monospace;
+    font-size:28px;font-weight:700;letter-spacing:-0.5px;
+    color:#e2e8f0;margin-bottom:6px;line-height:1.2;
+  }}
+  .sub{{font-size:11px;color:#3d5266;font-family:'IBM Plex Mono',monospace;
+        letter-spacing:1px;margin-bottom:8px}}
+  .divider{{border:none;border-top:1px solid #1a2332;margin:20px 0}}
+  p{{margin:10px 0;color:#b8c4ce}}
+  strong{{color:#e2e8f0}}
+  .footer{{margin-top:40px;font-size:9px;color:#3d5266;
+           font-family:'IBM Plex Mono',monospace;letter-spacing:1px;
+           border-top:1px solid #1a2332;padding-top:12px}}
+</style>
+</head>
+<body>
+<div class="fw-logo">FinWatch AI</div>
+<div class="badge">AI · Finance · Risk Assessment</div>
+<h1>{name}</h1>
+<div class="sub">{ticker} &nbsp;·&nbsp; {lang_labels.get(lang,"English")} &nbsp;·&nbsp; Analyst Report</div>
+<hr class="divider">
+{chart_tag}
+<hr class="divider">
+{safe_body}
+<div class="footer">Generated by FinWatch AI &nbsp;·&nbsp; For informational purposes only. Not financial advice.</div>
+</body></html>"""
+
+    # ── Modal header ──────────────────────────────────────────────────────────
+    _m_l, _m_r = st.columns([5, 2])
+    with _m_l:
+        st.markdown(
+            f'<div style="font-size:17px;font-weight:600;color:#e2e8f0;margin-bottom:2px">{name}</div>'
+            f'<div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;color:#3d5266;'
+            f'font-family:\'IBM Plex Mono\',monospace">{ticker} · {lang_labels.get(lang, lang.upper())}</div>',
+            unsafe_allow_html=True,
+        )
+    with _m_r:
+        st.download_button(
+            label="⬇ Download PDF",
+            data=html_content.encode("utf-8"),
+            file_name=f"finwatch_{ticker}_{lang[:2].upper()}.html",
+            mime="text/html",
+            use_container_width=True,
+        )
+
+    st.markdown('<div style="border-top:1px solid #1a2332;margin:12px 0 8px"></div>', unsafe_allow_html=True)
+
+    # ── Chart preview in modal ────────────────────────────────────────────────
+    if chart_b64:
+        st.markdown(
+            f'<img src="data:image/png;base64,{chart_b64}" '
+            f'style="width:100%;border-radius:6px;margin-bottom:16px" />',
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div style="border-top:1px solid #1a2332;margin:0 0 16px"></div>', unsafe_allow_html=True)
+
+    # ── Report body ───────────────────────────────────────────────────────────
+    rtl      = "direction:rtl;text-align:right;" if lang == "arabic" else ""
+    safe_txt = _md_to_html(display_text)
     st.markdown(
-        f'<div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;'
-        f'color:#5c7080;font-family:IBM Plex Mono;margin-bottom:14px">'
-        f'{ticker} · {lang_labels.get(lang, lang.upper())}</div>',
-        unsafe_allow_html=True,
-    )
-    with st.spinner("Translating…" if lang != "english" else "Loading…"):
-        display_text = translate(llm_text, lang, ticker)
-    rtl = "direction:rtl;text-align:right;" if lang == "arabic" else ""
-    safe_text = _md_to_html(display_text)
-    st.markdown(
-        f'<div style="font-size:12px;color:#adb5bd;line-height:1.9;'
-        f'font-family:IBM Plex Sans,sans-serif;{rtl}">'
-        f'{safe_text}</div>',
+        f'<div style="font-size:12px;color:#b8c4ce;line-height:1.9;'
+        f'font-family:\'IBM Plex Sans\',sans-serif;{rtl}">'
+        f'{safe_txt}</div>',
         unsafe_allow_html=True,
     )
 
@@ -71,52 +215,13 @@ def show_analysis_modal(ticker: str, news_df, lang: str) -> None:
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 def render_sidebar(decisions, price_data) -> None:
-    """Render the full left sidebar: logo, sector selector, watchlist, language."""
+    """Render sidebar: logo, sector selector, stock list."""
     with st.sidebar:
         st.markdown('<div class="logo">Fin<span>Watch</span> AI</div>', unsafe_allow_html=True)
 
-        if st.button("← Home", key="nav_home", use_container_width=True):
+        if st.button("← Home", key="sb_home", use_container_width=True):
             st.session_state.page = "landing"
             st.rerun()
-        st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
-
-        active_spx = "★ " if st.session_state.get("selected") == "^SPX" else ""
-        if st.button(f"{active_spx}S&P 500  ·  Market Overview", key="nav_spx", use_container_width=True):
-            st.session_state.selected     = "^SPX"
-            st.session_state.clicked_date = None
-            st.rerun()
-        st.markdown("<hr style='border-color:#1a2332;margin:4px 0 6px'>", unsafe_allow_html=True)
-
-        # ── ESCALATE Alerts ───────────────────────────────────────────────────
-        escalate_rows = decisions[decisions["action"] == "ESCALATE"]
-        if not escalate_rows.empty:
-            st.markdown(
-                '<div style="background:rgba(248,81,73,0.07);border:1px solid rgba(248,81,73,0.22);'
-                'border-radius:6px;padding:6px 8px 4px;margin-bottom:6px">'
-                '<div style="font-size:8px;letter-spacing:2px;color:#f85149;'
-                'font-family:\'IBM Plex Mono\',monospace;text-transform:uppercase;margin-bottom:4px">'
-                '⚠ Escalate Alerts</div></div>',
-                unsafe_allow_html=True,
-            )
-            for _, er in escalate_rows.iterrows():
-                t    = er["ticker"]
-                name = COMPANY_NAMES.get(t, t)
-                st.markdown('<div class="escalate-btn">', unsafe_allow_html=True)
-                if st.button(f"⚠ {name} ({t})", key=f"alert_{t}", use_container_width=True):
-                    st.session_state.selected     = t
-                    st.session_state.lang_modal   = st.session_state.get("language", "english")
-                    st.session_state.anomaly_date = None
-                    st.session_state.clicked_date = None
-                    if st.session_state.get("page") != "stocks":
-                        st.session_state.page = "stocks"
-                    # update sector to match ticker
-                    for s, ts in SECTORS.items():
-                        if t in ts:
-                            st.session_state.selected_sector = s
-                            break
-                    st.rerun()
-                st.markdown('</div>', unsafe_allow_html=True)
-            st.markdown("<hr style='border-color:#1a2332;margin:4px 0 6px'>", unsafe_allow_html=True)
 
         sector_names = list(SECTORS.keys())
         cur_sector   = st.session_state.selected_sector
@@ -128,6 +233,8 @@ def render_sidebar(decisions, price_data) -> None:
                               key="sector_select")
         if chosen != st.session_state.selected_sector:
             st.session_state.selected_sector = chosen
+
+        st.markdown("<hr style='border-color:#1a2332;margin:4px 0 4px'>", unsafe_allow_html=True)
 
         for t in SECTORS[chosen]:
             row_s = decisions[decisions["ticker"] == t]
@@ -146,24 +253,20 @@ def render_sidebar(decisions, price_data) -> None:
                 if t in price_data:
                     _, pct = price_data[t]
                     arrow  = "▲" if pct > 0 else ("▼" if pct < 0 else "—")
-                    css    = "wl-chg-up" if pct > 0 else ("wl-chg-dn" if pct < 0 else "wl-chg-fl")
-                    st.markdown(f'<div class="{css}">{arrow}{abs(pct):.1f}%</div>',
-                                unsafe_allow_html=True)
+                    color  = "#1de9b6" if pct > 0 else ("#f85149" if pct < 0 else "#3d5266")
+                    st.markdown(
+                        f'<div style="font-family:IBM Plex Mono;font-size:11px;color:{color};'
+                        f'text-align:right;line-height:1.8;padding-top:3px">'
+                        f'{arrow}{abs(pct):.1f}%</div>',
+                        unsafe_allow_html=True,
+                    )
 
-        st.markdown("<hr style='border-color:#1a2332;margin:8px 0'>", unsafe_allow_html=True)
-        st.markdown('<div class="sb-label">Analysis Language</div>', unsafe_allow_html=True)
-        lang_cols = st.columns(3)
-        for col, (code, label) in zip(lang_cols, [("english","EN"), ("german","DE"), ("arabic","AR")]):
-            with col:
-                if st.button(label, key=f"lang_{code}", type="secondary"):
-                    st.session_state.lang_modal = code
-                    st.rerun()
 
 
 # ── Stock header ──────────────────────────────────────────────────────────────
 
-def render_stock_header(ticker: str, name: str, det_df) -> tuple:
-    """Render the stock name / price header. Returns (last_price, last_chg)."""
+def render_stock_header(ticker: str, name: str, det_df, lang: str = "english") -> tuple:
+    """Render the stock name / price header + compact language switcher. Returns (last_price, last_chg)."""
     last_price, last_chg = None, None
     if det_df is not None and "Close" in det_df.columns and len(det_df) > 1:
         last_price = det_df["Close"].iloc[-1]
@@ -172,19 +275,69 @@ def render_stock_header(ticker: str, name: str, det_df) -> tuple:
     chg_html   = ""
     price_html = ""
     if last_chg is not None:
-        chg_html = (f'<span class="sh-up">▲ +{last_chg:.2f}%</span>'
-                    if last_chg >= 0 else
-                    f'<span class="sh-dn">▼ {last_chg:.2f}%</span>')
+        chg_color = "#1de9b6" if last_chg >= 0 else "#f85149"
+        chg_arr   = "▲" if last_chg >= 0 else "▼"
+        chg_html  = (f'<div style="font-size:12px;color:{chg_color};font-family:\'IBM Plex Mono\',monospace;'
+                     f'text-align:right;text-shadow:0 0 12px {chg_color}66">'
+                     f'{chg_arr} {abs(last_chg):.2f}%</div>')
     if last_price:
-        price_html = f'<span class="sh-price">${last_price:.2f}</span>'
+        price_html = (f'<div style="font-size:22px;font-weight:500;color:#e2e8f0;'
+                      f'font-family:\'IBM Plex Mono\',monospace;text-align:right">'
+                      f'${last_price:.2f}</div>')
 
-    st.markdown(f"""
-    <div class="stock-header">
-      <span class="sh-name">{name}</span>
-      <span class="sh-sub">{ticker} · NASDAQ</span>
-      {price_html}
-      {chg_html}
-    </div>""", unsafe_allow_html=True)
+    _hl, _hr = st.columns([6, 4])
+    with _hl:
+        st.markdown(
+            f'<div style="padding:6px 0 6px">'
+            f'<div class="sh-name">{name}</div>'
+            f'<div class="sh-sub">{ticker} · NASDAQ</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with _hr:
+        # ── REPORT — prominent, top ───────────────────────────────────────────
+        st.markdown(
+            '<div style="font-size:21px;font-weight:700;color:#e2e8f0;font-family:\'IBM Plex Mono\',monospace;'
+            'padding-top:3px;letter-spacing:4px;text-transform:uppercase;text-align:right;'
+            'text-shadow:0 0 18px rgba(226,232,240,0.45)">REPORT</div>',
+            unsafe_allow_html=True,
+        )
+        # ── Language switcher — small, right-aligned, below REPORT ───────────
+        st.markdown("""<style>
+[data-testid="stMarkdownContainer"]:has(#hdr-lang-marker) ~ [data-testid="stHorizontalBlock"] [data-testid="baseButton-secondary"],
+[data-testid="stMarkdownContainer"]:has(#hdr-lang-marker) ~ [data-testid="stHorizontalBlock"] [data-testid="baseButton-primary"] {
+    font-size: 8px !important;
+    padding: 1px 5px !important;
+    min-height: 20px !important;
+    line-height: 1.2 !important;
+    background-color: #0d1117 !important;
+    color: #5a6270 !important;
+    border-color: #1e2228 !important;
+    border-radius: 3px !important;
+    letter-spacing: 1.5px !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    box-shadow: none !important;
+}
+[data-testid="stMarkdownContainer"]:has(#hdr-lang-marker) ~ [data-testid="stHorizontalBlock"] [data-testid="baseButton-primary"] {
+    background-color: #161b22 !important;
+    color: #8892a4 !important;
+    border-color: #30363d !important;
+}
+</style><div id="hdr-lang-marker"></div>""", unsafe_allow_html=True)
+        _lpad, _lc1, _lc2, _lc3 = st.columns([4, 0.8, 0.8, 0.8])
+        for _col, (_code, _label) in zip([_lc1, _lc2, _lc3], [("english","en"), ("german","de"), ("arabic","ar")]):
+            with _col:
+                _active = (lang == _code)
+                if st.button(_label, key=f"lang_hdr_{_code}", type="primary" if _active else "secondary", use_container_width=True):
+                    st.session_state.language   = _code
+                    st.session_state.lang_modal = _code
+                    st.rerun()
+        # ── Price — below lang buttons ────────────────────────────────────────
+        st.markdown(
+            f'<div style="padding:4px 0 2px">{price_html}{chg_html}</div>',
+            unsafe_allow_html=True,
+        )
+
     return last_price, last_chg
 
 
@@ -240,34 +393,85 @@ def render_risk_news_row(ticker: str, row, det_df, decisions, news_df) -> None:
         es_html = (f'<span class="rp-val rp-dn">{es_ratio:.2f}</span>'
                    if es_ratio else '<span class="rp-val">—</span>')
 
-        # Anomaly detection row — only if ≥1 detector fired today
-        anom_count = 0
+        # Anomaly detection row — simple language with historical precision
+        anom_count  = 0
+        anom_weighted = 0.0
         if det_df is not None and not det_df.empty:
             _last = det_df.iloc[-1]
             for _c in ["z_anomaly", "z_anomaly_60", "if_anomaly", "ae_anomaly"]:
                 if _c in _last.index and bool(_last.get(_c)):
                     anom_count += 1
+            if "anomaly_score_weighted" in _last.index:
+                anom_weighted = float(_last.get("anomaly_score_weighted", 0))
+
         anom_row_html = ""
         if anom_count > 0:
-            _dots = (
-                "".join(['<span class="d d-on"></span>' for _ in range(anom_count)])
-                + "".join(['<span class="d d-off"></span>' for _ in range(4 - anom_count)])
-            )
+            # Look up historical precision for the current weighted score
+            prec_pct = None
+            anom_prec_df = load_anomaly_precision()
+            if anom_prec_df is not None:
+                candidates = anom_prec_df[
+                    (anom_prec_df["detector"] == "anomaly_score_weighted") &
+                    (anom_prec_df["signal"].str.extract(r">=\s*([\d.]+)")[0].astype(float) <= anom_weighted)
+                ]
+                if not candidates.empty:
+                    # Pick the highest threshold that still applies
+                    prec_pct = int(candidates.sort_values("precision", ascending=False).iloc[0]["precision"] * 100)
+
+            if prec_pct is not None:
+                label = (
+                    f"Unusual activity detected — in similar past situations, "
+                    f"there was a real risk <b>{prec_pct}% of the time</b>"
+                )
+            else:
+                label = f"Unusual activity detected by {anom_count} of 4 sensors"
+
             anom_row_html = (
-                '<div class="rp-row"><span class="rp-key">Anomaly detection</span>'
-                f'<div class="dot-row">{_dots}'
-                f'<span style="font-size:9px;color:#e3b341;margin-left:4px">{anom_count}/4</span>'
-                '</div></div>'
+                f'<div style="margin:6px 0 4px;padding:6px 8px;'
+                f'background:rgba(227,179,65,0.07);border-left:2px solid rgba(227,179,65,0.4);'
+                f'border-radius:0 4px 4px 0">'
+                f'<span style="font-size:10px;color:#c9a227;line-height:1.5">{label}</span>'
+                f'</div>'
             )
+
+        # ── Trading Signal Badge ──────────────────────────────────────────────
+        trading_signal = str(row.get("trading_signal", "NEUTRAL")) if "trading_signal" in row.index else "NEUTRAL"
+        _sig_cfg = {
+            "ENTRY":   ("#1de9b6", "rgba(29,233,182,0.12)", "rgba(29,233,182,0.35)", "▲ ENTRY"),
+            "EXIT":    ("#f85149", "rgba(248,81,73,0.12)",  "rgba(248,81,73,0.35)",  "▼ EXIT"),
+            "HOLD":    ("#58a6ff", "rgba(88,166,255,0.10)", "rgba(88,166,255,0.30)", "◆ HOLD"),
+            "NEUTRAL": ("#637a91", "rgba(30,45,65,0.4)",    "rgba(30,45,65,0.6)",   "— NEUTRAL"),
+        }
+        sig_c, sig_bg, sig_border, sig_label = _sig_cfg.get(trading_signal, _sig_cfg["NEUTRAL"])
+        signal_html = f"""
+        <div style="display:inline-flex;align-items:center;gap:8px;margin:6px 0 8px">
+          <div style="background:{sig_bg};border:1px solid {sig_border};
+                      border-radius:6px;padding:5px 14px;
+                      box-shadow:0 0 12px {sig_bg}">
+            <span style="font-family:'IBM Plex Mono',monospace;font-size:13px;
+                         font-weight:700;color:{sig_c};letter-spacing:1px">{sig_label}</span>
+          </div>
+          <span style="font-size:9px;color:#3d5266;font-family:'IBM Plex Mono',monospace">AI SIGNAL</span>
+        </div>"""
+
+        p_drawdown = row.get("p_drawdown", None)
+        dd_prob_html = ""
+        if p_drawdown is not None:
+            try:
+                p_val = float(p_drawdown)
+                p_col = "#f85149" if p_val >= 0.5 else "#e3b341" if p_val >= 0.35 else "#1de9b6"
+                dd_prob_html = f'<div class="rp-row"><span class="rp-key">Drawdown Prob</span><span class="rp-val" style="color:{p_col}">{p_val*100:.0f}%</span></div>'
+            except (TypeError, ValueError):
+                pass
 
         st.markdown(f"""
         <div class="rp-section">
           <div class="rp-title">AI Risk Analysis</div>
           <div class="sev-big {sev_cls}">{sev.replace('_',' ')}</div>
-          <div style="font-size:9px;color:#5c7080;margin-bottom:10px;font-family:IBM Plex Mono">{row.get('action','—')} · {row.get('date','—')}</div>
+          <div style="font-size:9px;color:#5c7080;margin-bottom:4px;font-family:IBM Plex Mono">{row.get('action','—')} · {row.get('date','—')}</div>
+          {signal_html}
           {anom_row_html}
-          <div class="rp-row"><span class="rp-key">Direction (5D)</span>
-            <span class="rp-val {dir_cls}">{dir_arr} {direction} ({int(p_down*100)}%)</span></div>
+          {dd_prob_html}
           <div class="rp-row"><span class="rp-key">Momentum</span>
             <span class="rp-val {mom_cls}">{mom_arr} {mom}</span></div>
           <div class="rp-row"><span class="rp-key">ES Ratio</span>{es_html}</div>
@@ -318,13 +522,6 @@ def render_risk_news_row(ticker: str, row, det_df, decisions, news_df) -> None:
                     f'{news_html}</div>',
                     unsafe_allow_html=True,
                 )
-        else:
-            st.markdown(
-                '<div class="rp-section"><div class="rp-title">News Sentiment</div>'
-                '<div style="font-size:10px;color:#5c7080;font-family:IBM Plex Mono">'
-                'Run FinBERT pipeline first</div></div>',
-                unsafe_allow_html=True,
-            )
 
 
 # ── Anomaly selector ──────────────────────────────────────────────────────────
@@ -339,7 +536,7 @@ _ANOMALY_PERIOD_OFFSETS = {
 _ANOMALY_DET_COLS = ["z_anomaly", "z_anomaly_60", "if_anomaly", "ae_anomaly"]
 
 
-def render_anomaly_selector(det_df, name: str, period: str = "1M") -> None:
+def render_anomaly_selector(det_df, name: str, period: str = "1M", dec_row=None) -> None:
     """Render the anomaly date dropdown filtered to the active chart period."""
     plot_df = det_df.copy()
 
@@ -381,7 +578,8 @@ def render_anomaly_selector(det_df, name: str, period: str = "1M") -> None:
         adate   = pd.Timestamp(st.session_state.anomaly_date)
         arow_df = det_df[det_df["Date"].dt.date == adate.date()]
         if not arow_df.empty:
-            explanation = explain_anomaly(arow_df.iloc[0], name, st.session_state.anomaly_date)
+            _dec = dec_row.iloc[0] if dec_row is not None and not dec_row.empty else None
+            explanation = explain_anomaly(arow_df.iloc[0], name, st.session_state.anomaly_date, _dec)
             if explanation:
                 st.markdown(explanation, unsafe_allow_html=True)
 
@@ -496,7 +694,7 @@ def render_candle_panel(det_df, clicked_date: str) -> None:
 # ── Analysis panel + LLM report ───────────────────────────────────────────────
 
 def render_strategy_box(det_df, dec_row) -> None:
-    """Rule-based investment strategy: two scenarios (not holding / holding)."""
+    """AI Trading Signal (ML) + rule-based context."""
     if det_df is None or det_df.empty or dec_row is None or dec_row.empty:
         return
 
@@ -505,96 +703,115 @@ def render_strategy_box(det_df, dec_row) -> None:
     close     = float(last.get("Close", 0))
     ema20     = float(det_df["Close"].ewm(span=20).mean().iloc[-1])
     rsi       = float(last.get("rsi", 50))
-    mom5      = float(last.get("momentum_5", 0))
-    mom10     = float(last.get("momentum_10", 0))
-    p_down    = float(row.get("p_down", 0.33))
-    p_up      = max(0.0, 1 - p_down - 0.15)
-    direction = str(row.get("direction", "stable"))
     mom_sig   = str(row.get("momentum_signal", "neutral"))
     sev       = str(row.get("severity", "NORMAL"))
+    p_drawdown = float(row.get("p_drawdown", 0.33)) if row.get("p_drawdown") is not None else 0.33
+    pe_ratio  = row.get("pe_ratio", None)
+    revenue_growth = row.get("revenue_growth", None)
 
     above_ema = close > ema20
     confirmed_det = [c for c in ["z_anomaly","z_anomaly_60","if_anomaly","ae_anomaly"]
                      if c in last.index and bool(last.get(c))]
     n_anom = len(confirmed_det)
 
-    # ── NOT HOLDING logic ─────────────────────────────────────────────────────
-    buy_signals  = sum([above_ema, rsi > 45, mom_sig == "rising", p_up > 0.50])
-    risk_signals = sum([sev in ("CRITICAL","WARNING"), n_anom >= 2, p_down > 0.55])
+    # ── ML Trading Signal (primary) ───────────────────────────────────────────
+    trading_signal = str(row.get("trading_signal", "NEUTRAL")) if "trading_signal" in row.index else "NEUTRAL"
+    confidence     = float(row.get("confidence", 0)) if row.get("confidence") is not None else 0.0
 
-    if risk_signals >= 2:
-        nh_action = "AVOID"
-        nh_color  = "#f85149"
-        nh_reason = f"Too risky to enter — {sev} severity" + (f", {n_anom} anomaly detectors" if n_anom >= 2 else "")
-    elif buy_signals >= 3:
-        nh_action = "WATCH FOR ENTRY"
-        nh_color  = "#1de9b6"
-        nh_reason = "Price above EMA20, momentum positive" + (", RSI strong" if rsi > 50 else "") + ". Wait for next green candle to confirm."
-    elif rsi < 35 and mom_sig == "rising":
-        nh_action = "POTENTIAL ENTRY"
-        nh_color  = "#e3b341"
-        nh_reason = f"Oversold (RSI {rsi:.0f}) with rising momentum — possible recovery forming. Wait for close above EMA20."
-    elif above_ema and mom_sig != "falling":
-        nh_action = "WATCH"
-        nh_color  = "#58a6ff"
-        nh_reason = f"Above EMA20 but momentum not confirmed. Wait for RSI > 50 and momentum turn."
-    else:
-        nh_action = "WAIT"
-        nh_color  = "#5c7080"
-        cond = []
-        if not above_ema: cond.append("price above EMA20")
-        if rsi < 45:      cond.append(f"RSI > 45 (now {rsi:.0f})")
-        if mom_sig == "falling": cond.append("momentum to stop falling")
-        nh_reason = "Wait for: " + " + ".join(cond) if cond else "No clear entry signal."
+    _sig_cfg = {
+        "ENTRY":   ("#1de9b6", "rgba(29,233,182,0.10)", "rgba(29,233,182,0.30)", "▲ ENTRY"),
+        "EXIT":    ("#f85149", "rgba(248,81,73,0.10)",  "rgba(248,81,73,0.30)",  "▼ EXIT"),
+        "HOLD":    ("#58a6ff", "rgba(88,166,255,0.08)", "rgba(88,166,255,0.25)", "◆ HOLD"),
+        "NEUTRAL": ("#637a91", "rgba(30,45,65,0.3)",    "rgba(30,45,65,0.5)",   "— NEUTRAL"),
+    }
+    sig_c, sig_bg, sig_border, sig_label = _sig_cfg.get(trading_signal, _sig_cfg["NEUTRAL"])
 
-    # ── HOLDING logic ─────────────────────────────────────────────────────────
-    sell_signals = sum([
-        direction == "down" and p_down > 0.55,
-        mom_sig == "falling",
-        not above_ema,
-        sev in ("CRITICAL", "WARNING"),
-        n_anom >= 2,
-    ])
+    _sig_desc = {
+        "ENTRY": "Models indicate low drawdown risk, positive momentum, and the stock is above its MA200. Conditions are favourable for a new position.",
+        "EXIT":  "High drawdown probability or critical anomaly detected. Models recommend reducing or closing the position.",
+        "HOLD":  "Mixed or neutral signals. No strong case for entry or exit at this time — maintain current position and monitor.",
+        "NEUTRAL": "Conflicting signals. No clear directional edge. Wait for confirmation.",
+    }
+    sig_desc = _sig_desc.get(trading_signal, "")
 
-    if sell_signals >= 4:
-        h_action = "REDUCE / EXIT"
-        h_color  = "#f85149"
-        h_reason = f"P(down)={p_down*100:.0f}%, below EMA20, falling momentum" + (f", {n_anom} anomaly models triggered" if n_anom >= 2 else "") + ". Cut or trim."
-    elif sell_signals >= 2:
-        h_action = "TRIM"
-        h_color  = "#e3b341"
-        h_reason = f"P(down)={p_down*100:.0f}% with {sell_signals} bearish signals. Consider reducing size."
-    elif direction == "up" and p_up > 0.50 and above_ema:
-        h_action = "HOLD"
-        h_color  = "#1de9b6"
-        h_reason = f"P(up)={p_up*100:.0f}%, above EMA20, direction positive. Stay in."
-    else:
-        h_action = "HOLD & MONITOR"
-        h_color  = "#58a6ff"
-        h_reason = "Mixed signals. Keep position but watch EMA20 and momentum for deterioration."
+    conf_html = f'<span style="font-size:12px;color:#3d5266;font-family:IBM Plex Mono;margin-left:10px">Confidence: {confidence*100:.0f}%</span>' if confidence > 0 else ""
+
+    # ── Rule-based context (secondary, compact) ────────────────────────────────
+    _ema_tip  = _tip("EMA20", "20-day Exponential Moving Average — short-term trend line.")
+    _rsi_tip  = _tip("RSI", "Relative Strength Index. Above 70: overbought. Below 30: oversold.")
+    _mom_tip  = _tip("Momentum", "Speed and direction of recent price change.")
+    _dd_tip   = _tip("Drawdown prob", "AI probability of a >5% price drop in the next 20 days.")
+    _anom_tip = _tip("anomaly detectors", "AI models that flag unusual price or volume behavior.")
+    _pe_tip   = _tip("P/E", "Price-to-Earnings ratio — how much investors pay per $1 of earnings.")
+    _rev_tip  = _tip("Revenue growth", "Year-over-year change in company revenue.")
+
+    context_items = []
+    context_items.append((f"above {_ema_tip}" if above_ema else f"below {_ema_tip}",
+                           "#1de9b6" if above_ema else "#f85149"))
+    context_items.append((f"{_rsi_tip} {rsi:.0f}" + (" — overbought" if rsi > 70 else " — oversold" if rsi < 30 else ""),
+                           "#f85149" if rsi > 70 else "#1de9b6" if rsi < 30 else "#8b949e"))
+    context_items.append((f"{_mom_tip}: {mom_sig}",
+                           "#1de9b6" if mom_sig == "rising" else "#f85149" if mom_sig == "falling" else "#8b949e"))
+    context_items.append((f"{_dd_tip}: {p_drawdown*100:.0f}%",
+                           "#f85149" if p_drawdown >= 0.5 else "#e3b341" if p_drawdown >= 0.35 else "#1de9b6"))
+    if n_anom > 0:
+        context_items.append((f"{n_anom}/4 {_anom_tip} triggered", "#e3b341"))
+    if pe_ratio is not None:
+        try:
+            pe_val = float(pe_ratio)
+            if pe_val < 0:
+                context_items.append((f"{_pe_tip} negative — earnings loss", "#f85149"))
+            elif pe_val > 50:
+                context_items.append((f"{_pe_tip} {pe_val:.0f} — elevated valuation", "#e3b341"))
+            else:
+                context_items.append((f"{_pe_tip} {pe_val:.0f}", "#8b949e"))
+        except (TypeError, ValueError):
+            pass
+    if revenue_growth is not None:
+        try:
+            rg = float(revenue_growth)
+            if rg < -0.05:
+                context_items.append((f"{_rev_tip} {rg*100:.0f}%", "#f85149"))
+            elif rg > 0.10:
+                context_items.append((f"{_rev_tip} +{rg*100:.0f}%", "#1de9b6"))
+        except (TypeError, ValueError):
+            pass
+
+    ctx_html = "".join(
+        f'<div style="display:flex;align-items:center;gap:6px;padding:4px 0">'
+        f'<span style="color:{c};font-size:11px;flex-shrink:0">●</span>'
+        f'<span style="font-size:10px;color:#b8c4ce;line-height:1.4">{lbl}</span>'
+        f'</div>'
+        for lbl, c in context_items
+    )
 
     st.markdown(f"""
-    <div style="background:#0d1117;border:1px solid #1a2332;border-radius:3px;
-                padding:10px 16px;margin-top:8px">
-      <div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;
-                  color:#5c7080;font-family:'IBM Plex Mono',monospace;
-                  border-bottom:1px solid #1a2332;padding-bottom:6px;margin-bottom:8px">
-        Investment Strategy
+    <div style="background:rgba(11,17,26,0.8);border:1px solid rgba(30,45,65,0.6);
+                border-radius:10px;padding:16px 20px;margin-top:10px;
+                box-shadow:0 4px 20px rgba(0,0,0,0.3),inset 0 1px 0 rgba(255,255,255,0.03)">
+      <div style="font-size:10px;letter-spacing:2.5px;text-transform:uppercase;
+                  color:#3d5266;font-family:'IBM Plex Mono',monospace;
+                  border-bottom:1px solid rgba(30,45,65,0.6);padding-bottom:8px;margin-bottom:14px">
+        AI Trading Signal
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:16px;align-items:start">
         <div>
-          <div style="font-size:8px;color:#5c7080;font-family:'IBM Plex Mono',monospace;
-                      letter-spacing:1px;margin-bottom:4px">NOT HOLDING</div>
-          <div style="font-size:13px;font-weight:600;color:{nh_color};
-                      font-family:'IBM Plex Mono',monospace;margin-bottom:4px">{nh_action}</div>
-          <div style="font-size:10px;color:#8b949e;line-height:1.5">{nh_reason}</div>
+          <div style="background:{sig_bg};border:1px solid {sig_border};border-radius:8px;
+                      padding:10px 22px;text-align:center;
+                      box-shadow:0 0 20px {sig_bg}">
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:20px;font-weight:700;
+                        color:{sig_c};letter-spacing:2px">{sig_label}</div>
+          </div>
+          {conf_html}
         </div>
-        <div style="border-left:1px solid #1a2332;padding-left:12px">
-          <div style="font-size:8px;color:#5c7080;font-family:'IBM Plex Mono',monospace;
-                      letter-spacing:1px;margin-bottom:4px">HOLDING</div>
-          <div style="font-size:13px;font-weight:600;color:{h_color};
-                      font-family:'IBM Plex Mono',monospace;margin-bottom:4px">{h_action}</div>
-          <div style="font-size:10px;color:#8b949e;line-height:1.5">{h_reason}</div>
+        <div>
+          <div style="font-size:11px;color:#b8c4ce;line-height:1.6;margin-bottom:10px">{sig_desc}</div>
+          <div style="border-top:1px solid rgba(30,45,65,0.5);padding-top:8px">
+            <div style="font-size:10px;letter-spacing:1.5px;color:#3d5266;
+                        font-family:'IBM Plex Mono',monospace;text-transform:uppercase;
+                        margin-bottom:6px">Signal Factors</div>
+            {ctx_html}
+          </div>
         </div>
       </div>
     </div>""", unsafe_allow_html=True)
@@ -628,8 +845,7 @@ def _md_to_html(text: str) -> str:
 
 
 def render_llm_report(ticker: str, news_df, lang: str, dec_row=None) -> None:
-    """Render the full LLM analyst report, with translation if needed.
-    Falls back to the decision summary when no proper LLM report exists."""
+    """Render the full LLM analyst report with integrated language switcher."""
     llm_text  = ""
     fallback  = False
 
@@ -637,7 +853,6 @@ def render_llm_report(ticker: str, news_df, lang: str, dec_row=None) -> None:
         llm_text = news_df[news_df["ticker"] == ticker].iloc[0].get("llm_summary", "") or ""
 
     if len(llm_text) < 120:
-        # Try decision summary as fallback
         if dec_row is not None and not dec_row.empty:
             fb = dec_row.iloc[0].get("summary", "") or ""
             if len(fb) > 10:
@@ -646,26 +861,74 @@ def render_llm_report(ticker: str, news_df, lang: str, dec_row=None) -> None:
         if not fallback:
             return
 
+    # ── Section divider ──────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="border-top:1px solid #1a2332;margin:20px 0 0"></div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Header row: title left, language tabs right ──────────────────────────
+    report_label = "AI Risk Summary" if fallback else "AI Analyst Report"
+    _hdr_l, _hdr_r = st.columns([5, 3])
+    with _hdr_l:
+        st.markdown(
+            f'<div style="font-size:17px;font-weight:600;color:#e2e8f0;'
+            f'font-family:\'Inter\',sans-serif;padding-top:10px;letter-spacing:-0.3px">'
+            f'{report_label}</div>',
+            unsafe_allow_html=True,
+        )
+    with _hdr_r:
+        st.markdown("""<style>
+[data-testid="stMarkdownContainer"]:has(#rpt-lang-marker) ~ [data-testid="stHorizontalBlock"] [data-testid="baseButton-secondary"],
+[data-testid="stMarkdownContainer"]:has(#rpt-lang-marker) ~ [data-testid="stHorizontalBlock"] [data-testid="baseButton-primary"] {
+    font-size: 8px !important;
+    padding: 1px 5px !important;
+    min-height: 22px !important;
+    line-height: 1.2 !important;
+    background-color: #0d1117 !important;
+    color: #5a6270 !important;
+    border-color: #1e2228 !important;
+    border-radius: 3px !important;
+    letter-spacing: 1.5px !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    box-shadow: none !important;
+}
+[data-testid="stMarkdownContainer"]:has(#rpt-lang-marker) ~ [data-testid="stHorizontalBlock"] [data-testid="baseButton-primary"] {
+    background-color: #161b22 !important;
+    color: #8892a4 !important;
+    border-color: #30363d !important;
+}
+</style><div id="rpt-lang-marker"></div>""", unsafe_allow_html=True)
+        _lang_cols = st.columns([1, 1, 1, 2])
+        for _col, (_code, _label) in zip(_lang_cols[:3], [("english","EN"), ("german","DE"), ("arabic","AR")]):
+            with _col:
+                _active = (lang == _code)
+                if st.button(
+                    _label,
+                    key=f"lang_{_code}",
+                    type="primary" if _active else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state.language = _code
+                    st.rerun()
+
+    # ── Report body ───────────────────────────────────────────────────────────
     with st.spinner("Translating..." if (lang != "english" and not fallback) else ""):
         display_text = translate(llm_text, lang, ticker) if not fallback else llm_text
 
-    rtl_style    = "direction:rtl;text-align:right;" if lang == "arabic" else ""
-    report_label = "AI Risk Summary" if fallback else "AI Analyst Report"
-    note_html    = (
-        '<div style="font-size:9px;color:#5c7080;font-family:IBM Plex Mono;'
-        'margin-top:8px">Full LLM report not generated yet — re-run the narrator pipeline.</div>'
+    rtl_style = "direction:rtl;text-align:right;" if lang == "arabic" else ""
+    note_html = (
+        '<div style="font-size:9px;color:#3d5266;font-family:IBM Plex Mono;margin-top:10px">'
+        'Full LLM report not generated yet — re-run the narrator pipeline.</div>'
     ) if fallback else ""
 
     safe_text = _md_to_html(display_text)
 
-    st.markdown(f"""
-    <div style="background:#0d1117;border:1px solid #1a2332;border-radius:3px;
-                padding:14px 18px;margin-top:8px">
-      <div style="font-size:9px;letter-spacing:2px;text-transform:uppercase;
-                  color:#5c7080;font-family:'IBM Plex Mono',monospace;
-                  border-bottom:1px solid #1a2332;padding-bottom:7px;
-                  margin-bottom:10px">{report_label}</div>
-      <div style="font-size:11px;color:#adb5bd;line-height:1.8;
-                  font-family:'IBM Plex Sans',sans-serif;{rtl_style}">{safe_text}</div>
-      {note_html}
-    </div>""", unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="background:rgba(13,17,23,0.7);border:1px solid #1a2332;'
+        f'border-radius:6px;padding:16px 20px;margin-top:6px">'
+        f'<div style="font-size:12px;color:#b8c4ce;line-height:1.9;'
+        f'font-family:\'IBM Plex Sans\',sans-serif;{rtl_style}">{safe_text}</div>'
+        f'{note_html}</div>',
+        unsafe_allow_html=True,
+    )

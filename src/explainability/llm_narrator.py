@@ -11,11 +11,13 @@ within Groq free tier limits (30 req/min). Use severity_filter=None for all.
 """
 
 import os
+import json
 import time
 import logging
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from datetime import date
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -24,7 +26,7 @@ load_dotenv(ROOT / ".env")
 
 MODEL       = "llama-3.3-70b-versatile"
 TEMPERATURE = 0.2
-MAX_TOKENS  = 600
+MAX_TOKENS  = 1100
 
 LANGUAGE_INSTRUCTION = {
     "english": "Respond in English.",
@@ -34,16 +36,48 @@ LANGUAGE_INSTRUCTION = {
 
 DEFAULT_SEVERITY_FILTER = {"CRITICAL", "WARNING"}
 
+CACHE_PATH = ROOT / "data/explanations/llm_cache.json"
+
+
+def _load_cache() -> dict:
+    if CACHE_PATH.exists():
+        return json.loads(CACHE_PATH.read_text())
+    return {}
+
+
+def _save_cache(cache: dict) -> None:
+    CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2))
+
+
+def _cache_key(ticker: str) -> str:
+    return f"{date.today().isoformat()}_{ticker}"
+
 
 def _load_detection_latest(ticker: str, detection_dir: Path) -> dict:
-    """Load latest row from detection parquet for a ticker."""
+    """Load latest row + historical context (EMA20, monthly summaries, 3M range)."""
     f = detection_dir / f"{ticker}.parquet"
     if not f.exists():
         return {}
     df = pd.read_parquet(f)
     df["Date"] = pd.to_datetime(df["Date"])
-    r = df.sort_values("Date").iloc[-1]
-    return r.to_dict()
+    df = df.sort_values("Date")
+    r = df.iloc[-1].to_dict()
+
+    closes = df["Close"].values
+    r["current_price"] = float(closes[-1])
+    r["ema_20"] = float(pd.Series(closes).ewm(span=20).mean().iloc[-1])
+
+    df_3m = df[df["Date"] >= df["Date"].max() - pd.Timedelta(days=90)]
+    r["price_3m_high"] = float(df_3m["Close"].max())
+    r["price_3m_low"]  = float(df_3m["Close"].min())
+
+    monthly = []
+    for label, grp in df.tail(120).groupby(df.tail(120)["Date"].dt.to_period("M")):
+        monthly.append(f"{label}: high={grp['Close'].max():.2f} low={grp['Close'].min():.2f} close={grp['Close'].iloc[-1]:.2f}")
+    r["monthly_summary"] = " | ".join(monthly[-4:])
+
+    return r
 
 
 def _build_prompt(row: dict, language: str) -> str:
@@ -64,10 +98,11 @@ def _build_prompt(row: dict, language: str) -> str:
     obv        = row.get("obv_signal", 0)
     confirm    = row.get("confirmation", "neutral")
 
-    # Direction model
+    # Direction model — use real probabilities from decisions.parquet
     direction  = row.get("direction", "stable")
     p_down     = float(row.get("p_down", 0.33))
-    p_up       = max(0.0, 1 - p_down - 0.15)
+    p_up       = float(row.get("p_up", 0.33))
+    p_stable   = float(row.get("p_stable", max(0.0, 1.0 - p_down - p_up)))
     mom_sig    = row.get("momentum_signal", "neutral")
 
     # Anomaly
@@ -101,69 +136,132 @@ def _build_prompt(row: dict, language: str) -> str:
              else "sector-wide" if sec_wide
              else "stock-specific")
 
-    anomaly_detected = "Yes" if anomaly_score > 1 else "No"
+    anomaly_detected = "Yes" if anomaly_score >= 1 else "No"
     models_used      = ", ".join(detectors) if detectors else "None"
-    news_sentiment   = row.get("news_sentiment", "neutral")
+    news_sentiment   = row.get("news_sentiment_score", row.get("sentiment_note", "neutral"))
     existing_summary = row.get("narrative", row.get("summary", ""))
 
-    return f"""You are a sharp equity research analyst. Write short, direct, actionable analysis.
+    current_price   = row.get("current_price", row.get("Close", 0))
+    ema_20          = row.get("ema_20", current_price)
+    price_3m_high   = row.get("price_3m_high", current_price)
+    price_3m_low    = row.get("price_3m_low", current_price)
+    monthly_summary = row.get("monthly_summary", "N/A")
+    support         = round(current_price * 0.92, 2)   # ~8% below as rough support
+
+    ema_diff_pct    = ((current_price / ema_20) - 1) * 100 if ema_20 else 0
+    ema_position    = (f"{ema_diff_pct:+.1f}% above EMA20 ({ema_20:.2f})" if ema_diff_pct > 0.3
+                       else f"{abs(ema_diff_pct):.1f}% below EMA20 ({ema_20:.2f})" if ema_diff_pct < -0.3
+                       else f"on EMA20 ({ema_20:.2f}) — critical level")
+
+    # Investment strategy levels
+    daily_vol       = vol if vol > 0 else 0.015
+    entry_low       = round(ema_20 * (1 - daily_vol), 2)      # 1 daily-vol below EMA20
+    entry_high      = round(ema_20 * (1 + daily_vol * 0.5), 2) # half daily-vol above EMA20
+    exit_target     = round(price_3m_high * 0.98, 2)           # just below 3M resistance
+    exit_spike      = round(price_3m_high, 2)                  # at 3M high = resistance
+
+    # Reduction % based on p_down + risk confidence + anomaly
+    _red_base = max(0, (p_down - 0.45) * 100)                  # 0% at p_down≤0.45, scales up
+    _red_base += 10 if anomaly_score >= 2 else 0
+    _red_base += 10 if row.get("p_high", 0) >= 0.65 else 0
+    reduction_pct   = min(int(_red_base), 75)
+
+    return f"""You are a sharp equity analyst. Write direct, actionable analysis.
 {lang}
 
 RULES:
-- MAX 2 sentences per section. No filler words.
-- No jargon. Speak like a trader, not a textbook.
-- Use ONLY the data below. Do not invent numbers.
-- Models only in brackets: e.g. [LSTM-AE, Z-Score].
+- Use ONLY the numbers from DATA. Do not invent prices or percentages.
+- Be specific: name exact price levels from the data.
+- Write like a trader, not a textbook.
+- Translate ALL section headers and text to the language specified above.
 
-Structure EXACTLY as follows:
+Output EXACTLY this structure (7 sections, translate headers):
 
----
-
-**Executive Summary**
-One sentence on trend + risk level. One sentence on what the investor should know right now.
-
----
-
-**Technical Analysis**
-RSI + momentum in one sentence. What it signals in one sentence.
+## Current Situation
+- **Price: {current_price:.2f} ({ret_1d*100:+.2f}% today)** [🔴 if negative, 🟢 if positive]
+- Volume: [format as e.g. 1.57M] — [above/below average comment based on vol_ratio={vol_ratio:.1f}x]
+- RSI: {rsi:.1f} — [interpretation: <30=oversold, 30-45=weak, 45-55=neutral, 55-70=strong, >70=overbought]
+- Price is {ema_position} — [critical/normal comment]
 
 ---
 
-**Anomaly & Risk Signals**
-One sentence: anomaly yes/no and which models [in brackets]. One sentence on what it means.
+## Chart Analysis
+Using the monthly price history, describe the price cycle in 3-4 short lines:
+```
+[Month]: [e.g. Peak ~X.XX]
+[Month]: [e.g. Low ~X.XX]
+[Month]: [current situation]
+```
+One sentence: which phase are we currently in.
 
 ---
 
-**AI Forecast**
-One sentence: direction + probabilities. One sentence: main driver in plain language.
+## Probabilities Next 1-2 Weeks
+
+| Scenario | Probability | Condition |
+|----------|-------------|-----------|
+| 📉 **Further down** | **{p_down*100:.0f}%** | [specific: e.g. price breaks below EMA {ema_20:.2f}] |
+| ➡️ **Sideways** | **{p_stable*100:.0f}%** | [range: e.g. holds {price_3m_low:.2f}–{price_3m_high:.2f}] |
+| 📈 **Recovery** | **{p_up*100:.0f}%** | [specific: e.g. volume spike + close above X.XX] |
 
 ---
 
-**Risk Assessment**
-One sentence: risk level + scope (market/sector/stock). One sentence: key risk factor for investor.
+## Signals
+
+**🔴 Bearish signals:**
+[2-3 bullets from data: 1-day drop, momentum, news, market context]
+
+**🟢 Positive factors:**
+[2-3 bullets from data: RSI not oversold, support holding, regime, etc.]
 
 ---
 
-**Investment Strategy**
-TWO lines — both are REQUIRED:
-→ Not holding: [specific entry condition, e.g. "Wait for RSI > 40 and momentum turning positive before buying."]
-→ Holding: [specific action based on data, e.g. "Trim position — P(down)={p_down*100:.0f}% with falling momentum confirms further downside." OR "Hold — direction stable and no anomaly."]
+## Decision Tree Tomorrow
 
-Base this on the actual data:
-- If direction=down AND p_down > 0.50: holding → reduce/trim
-- If direction=up AND p_up > 0.50: not holding → look for entry when momentum confirms
-- If RSI < 35 and momentum_signal=rising: potential recovery entry signal
-- If anomaly_score >= 2: flag as elevated risk for both scenarios
-Do NOT write "WAIT" for both. Give different advice for each scenario.
+```
+Opens above {current_price * 1.02:.2f}: → [action]
+Opens below {current_price * 0.97:.2f}: → [action, next support ~{support}]
+Opens between: → wait
+```
+
+---
+
+## Stop Loss
+[One sentence: suggested stop loss level with brief rationale based on 3M low={price_3m_low:.2f} and volatility]
+
+---
+
+## Investment Strategy
+
+**→ Not holding:**
+Based on direction={direction.upper()} and support at EMA20={ema_20:.2f}:
+- If looking to enter: wait for price to reach the zone **{entry_low:.2f} – {entry_high:.2f}** (EMA20 support zone)
+- Only enter if volume confirms (above average) and RSI is not falling further
+- Do NOT chase if price is already {ema_diff_pct:+.1f}% away from EMA20
+
+**→ Holding:**
+{"Reduce position by ~" + str(reduction_pct) + "% — P(down)=" + f"{p_down*100:.0f}%" + " with risk=" + row.get("severity","?") + ". Keep core position only." if reduction_pct >= 20
+ else "Hold — no strong exit signal yet. Watch for price breaking below " + f"{entry_low:.2f}" + "."}
+
+**→ Take profit / Sell signal:**
+- Consider selling {f"20–30% at {exit_target:.2f} (near 3M resistance)" if p_down < 0.50 else f"50%+ at {exit_target:.2f} — high downside probability"}
+- Full exit if price reaches {exit_spike:.2f} (3M high) AND P(down) > 50%
+- [Add one sentence based on news sentiment and anomaly scope]
+
+> ⚠️ *Probabilities based on technical analysis — not guaranteed.*
 
 ---
 
 DATA:
 Ticker: {row['ticker']}
 Date: {row.get('date', 'latest')}
+Current Price: {current_price:.4f}
+EMA20: {ema_20:.4f} ({ema_position})
+3M High: {price_3m_high:.4f} | 3M Low: {price_3m_low:.4f}
+Monthly Price History: {monthly_summary}
 Price Change (1D): {ret_1d*100:+.2f}%
 RSI: {rsi:.1f}
-Momentum (5D / 10D): {mom5:+.3f} / {mom10:+.3f} ($ price change over 5 / 10 days)
+Momentum (5D / 10D): {mom5:+.3f} / {mom10:+.3f}
 Trend / Regime: {regime}
 Volume vs 20D avg: {vol_ratio:.1f}x ({confirm})
 OBV Signal: {obv:+.3f}
@@ -176,14 +274,11 @@ Anomaly Scope: {scope}
 AI Direction Forecast (5D): {direction.upper()} | P(down)={p_down*100:.0f}% | P(up)={p_up*100:.0f}%
 Main Risk Driver: {driver}
 Top Contributing Factors: {top3}
-Signal Pattern: {narrative}
 Risk Level: {row['severity']}
 Recommended Action: {row['action']}
-Model Confidence: {int(row['confidence']*100)}%
 Signal Conflicts: {conflict if conflict else 'None'}
 Caution Flags: {caution if caution else 'None'}
-News Sentiment: {news_sentiment}
-Existing Analysis Summary: {existing_summary}"""
+News Sentiment: {news_sentiment}"""
 
 
 def summarize(row: dict, language: str = "english", retries: int = 4) -> str:
@@ -250,9 +345,18 @@ def run(
     print(f"Processing {len(to_process)} tickers (filter: {severity_filter or 'all'})")
     print("=" * 65)
 
+    cache   = _load_cache()
     results = []
     for _, row in to_process.iterrows():
         ticker   = row["ticker"]
+        key      = _cache_key(ticker)
+
+        # Cache hit — skip Groq entirely
+        if key in cache:
+            print(f"\n{ticker} [{row['severity']}] (cached)")
+            results.append({"ticker": ticker, "llm_summary": cache[key]})
+            continue
+
         row_dict = row.to_dict()
 
         # Enrich with latest detection data
@@ -263,11 +367,18 @@ def run(
         if decisions_df is not None:
             dec_rows = decisions_df[decisions_df["ticker"] == ticker]
             if not dec_rows.empty:
-                for col in ["direction", "p_down", "momentum_signal", "caution_flag", "summary"]:
+                for col in [
+                    "direction", "p_up", "p_stable", "p_down", "p_high",
+                    "momentum_signal", "caution_flag", "summary",
+                    "vader_score", "finbert_score", "news_sentiment_score",
+                ]:
                     if col in dec_rows.columns:
                         row_dict[col] = dec_rows.iloc[0][col]
 
         summary = summarize(row_dict, language=language)
+        cache[key] = summary
+        _save_cache(cache)
+
         results.append({"ticker": ticker, "llm_summary": summary})
         print(f"\n{ticker} [{row['severity']}]")
         print(f"  {summary[:120]}...")
